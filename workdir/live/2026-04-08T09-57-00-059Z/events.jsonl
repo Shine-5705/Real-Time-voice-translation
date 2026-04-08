@@ -1,0 +1,49 @@
+{"ts":"2026-04-08T09:57:00.062Z","event":"session_start","source_language":"en-IN","target_language":"hi-IN"}
+{"ts":"2026-04-08T09:57:00.358Z","event":"status","running":true,"message":"Pipeline started (en-IN -> hi-IN)."}
+{"ts":"2026-04-08T09:57:00.364Z","event":"status","running":true,"message":"Connected to STT. Speak now."}
+{"ts":"2026-04-08T09:57:05.623Z","event":"status","running":true,"message":"Processing speech segment..."}
+{"ts":"2026-04-08T09:57:05.652Z","event":"segment_received","segment_id":1,"source_text":"అమె అయి అడిబిల్ టు యూ","detected_language":"te","latency":319}
+{"ts":"2026-04-08T09:57:09.121Z","event":"segment_translated","segment_id":1,"source_language":"te-IN","target_language":"hi-IN","source_text":"అమె అయి అడిబిల్ టు యూ","translated_text":"वो तुम्हारे लिये प्यारी है"}
+{"ts":"2026-04-08T09:57:18.392Z","event":"status","running":true,"message":"Realtime STT unavailable. Using REST STT fallback."}
+{"ts":"2026-04-08T09:57:18.393Z","event":"status","running":true,"message":"Auto-failover: switched STT from WebSocket to REST due to no transcript events."}
+{"ts":"2026-04-08T09:57:19.593Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:20.800Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:22.012Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:22.551Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:23.220Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:23.420Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:24.429Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:25.640Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:26.850Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:28.063Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:28.338Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:29.278Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:29.707Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:29.793Z","event":"segment_tts","segment_id":1,"audio_bytes":61484}
+{"ts":"2026-04-08T09:57:29.796Z","event":"segment_received","segment_id":2,"source_text":"Chambedi.","detected_language":"en-IN","latency":"rest"}
+{"ts":"2026-04-08T09:57:30.478Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:31.121Z","event":"segment_translated","segment_id":2,"source_language":"en-IN","target_language":"hi-IN","source_text":"Chambedi.","translated_text":"चम्बेड़ी"}
+{"ts":"2026-04-08T09:57:31.687Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:32.888Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:34.092Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:34.287Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:35.307Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:36.520Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:37.728Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:38.941Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:40.143Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:42.554Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:42.829Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:44.967Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:45.279Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:47.383Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:47.647Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:49.798Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:50.009Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:52.217Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:52.266Z","event":"segment_tts","segment_id":2,"audio_bytes":46124}
+{"ts":"2026-04-08T09:57:52.271Z","event":"segment_received","segment_id":3,"source_text":"Is it feeling-","detected_language":"en-IN","latency":"rest"}
+{"ts":"2026-04-08T09:57:52.476Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-08T09:57:53.836Z","event":"segment_translated","segment_id":3,"source_language":"en-IN","target_language":"hi-IN","source_text":"Is it feeling-","translated_text":"क्या यह महसूस हो रहा है"}
+{"ts":"2026-04-08T09:57:54.635Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T09:57:54.914Z","event":"segment_skipped_noise","raw_text":"."}

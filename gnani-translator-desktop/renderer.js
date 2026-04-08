@@ -21,8 +21,13 @@ let playbackActive = false;
 let sttFrameQueue = [];
 let sttSendTimer = null;
 let lastMicTelemetryTs = 0;
+let inputDeviceById = new Map();
 const TARGET_SAMPLE_RATE = 16000;
 const PREAMP_GAIN = 1.8;
+const TTS_CHUNK_AGGREGATE_MS = 180;
+let ttsChunkBytesQueue = [];
+let ttsChunkMeta = { sampleRate: 16000, numChannels: 1, sampleWidth: 2 };
+let ttsAggregateTimer = null;
 
 const LANGUAGES = [
   ['bn-IN', 'Bengali'],
@@ -186,6 +191,56 @@ function base64ToBlob(base64, mimeType) {
   return new Blob([bytes], { type: mimeType || 'audio/wav' });
 }
 
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...slice);
+  }
+  return btoa(binary);
+}
+
+function pcm16ChunkToWavBlob(base64Pcm, sampleRate = 16000, channels = 1, sampleWidth = 2) {
+  const pcmBytes = base64ToBytes(base64Pcm);
+  const bitsPerSample = sampleWidth * 8;
+  const byteRate = sampleRate * channels * sampleWidth;
+  const blockAlign = channels * sampleWidth;
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + pcmBytes.length, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, pcmBytes.length, true);
+
+  return new Blob([header, pcmBytes], { type: 'audio/wav' });
+}
+
 async function playNextAudioInQueue() {
   if (playbackActive || playbackQueue.length === 0) {
     return;
@@ -215,12 +270,59 @@ async function playNextAudioInQueue() {
   }
 }
 
+function startTtsAggregateTimer() {
+  stopTtsAggregateTimer();
+  ttsAggregateTimer = setInterval(() => {
+    flushAggregatedTtsChunks();
+  }, TTS_CHUNK_AGGREGATE_MS);
+}
+
+function stopTtsAggregateTimer() {
+  if (ttsAggregateTimer) {
+    clearInterval(ttsAggregateTimer);
+    ttsAggregateTimer = null;
+  }
+}
+
+function flushAggregatedTtsChunks(force = false) {
+  if (ttsChunkBytesQueue.length === 0) {
+    return;
+  }
+
+  if (!force && ttsChunkBytesQueue.length < 2) {
+    // Keep a tiny buffer to reduce micro-gaps between consecutive chunks.
+    return;
+  }
+
+  const totalLen = ttsChunkBytesQueue.reduce((sum, arr) => sum + arr.length, 0);
+  const merged = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const arr of ttsChunkBytesQueue) {
+    merged.set(arr, offset);
+    offset += arr.length;
+  }
+
+  ttsChunkBytesQueue = [];
+  const base64Merged = bytesToBase64(merged);
+  const blob = pcm16ChunkToWavBlob(
+    base64Merged,
+    ttsChunkMeta.sampleRate,
+    ttsChunkMeta.numChannels,
+    ttsChunkMeta.sampleWidth
+  );
+  const url = URL.createObjectURL(blob);
+  playbackQueue.push({ url });
+  playNextAudioInQueue();
+}
+
 function isVirtualLabel(label) {
   return /cable|blackhole|virtual/i.test(label);
 }
 
 function teardownAudioGraph() {
   stopPacedSttSender();
+  stopTtsAggregateTimer();
+  ttsChunkBytesQueue = [];
 
   if (processorNode) {
     processorNode.disconnect();
@@ -285,6 +387,7 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
   teardownAudioGraph();
   selectedOutputSinkId = outputDeviceId;
   startPacedSttSender();
+  startTtsAggregateTimer();
 
   inputStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -347,6 +450,12 @@ startBtn.addEventListener('click', () => {
     return;
   }
 
+  const selectedMicLabel = inputDeviceById.get(selectedMic) || '';
+  if (isVirtualLabel(selectedMicLabel)) {
+    statusEl.textContent = 'Status: Choose your physical microphone as input. Do not select CABLE Output as mic.';
+    return;
+  }
+
   if (!validateLanguages()) {
     return;
   }
@@ -388,6 +497,7 @@ async function loadDevices() {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const mics = devices.filter((d) => d.kind === 'audioinput');
     const outputs = devices.filter((d) => d.kind === 'audiooutput');
+    inputDeviceById = new Map(mics.map((d) => [d.deviceId, d.label || '']));
 
     micSelect.innerHTML = '<option value="">-- Select Physical Mic --</option>';
     outputSelect.innerHTML = '<option value="">-- Select Virtual Output --</option>';
@@ -453,6 +563,21 @@ window.electronAPI.onTranslatedAudio((payload) => {
   const url = URL.createObjectURL(blob);
   playbackQueue.push({ url });
   playNextAudioInQueue();
+});
+
+window.electronAPI.onTranslatedAudioChunk((payload) => {
+  const bytes = base64ToBytes(payload.audioBase64);
+  ttsChunkMeta = {
+    sampleRate: payload.sampleRate || 16000,
+    numChannels: payload.numChannels || 1,
+    sampleWidth: payload.sampleWidth || 2,
+  };
+  ttsChunkBytesQueue.push(bytes);
+  flushAggregatedTtsChunks(false);
+});
+
+window.electronAPI.onTranslatedAudioDone(() => {
+  flushAggregatedTtsChunks(true);
 });
 
 window.addEventListener('beforeunload', () => {

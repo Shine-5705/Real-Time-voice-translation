@@ -27,6 +27,10 @@ let lastSpeechDetectedAt = 0;
 let lastTranscriptAt = 0;
 let sttHealthTimer = null;
 let wsHealthFailoverTriggered = false;
+let restOverlapBuffer = Buffer.alloc(0);
+let lastEnqueuedTranscriptNorm = '';
+let ttsJobQueue = [];
+let ttsWorkerActive = false;
 
 function nowISO() {
   return new Date().toISOString();
@@ -173,6 +177,14 @@ function isMeaningfulTranscript(text) {
   // Accept only segments that contain at least one letter or number.
   // This avoids translating pure punctuation/noise like "." or "।".
   return /[\p{L}\p{N}]/u.test(value);
+}
+
+function normalizeTranscriptForDedupe(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function normalizeLangCode(langCode) {
@@ -396,29 +408,6 @@ async function synthesizeTTS(text) {
   const voice = env('VACHANA_TTS_VOICE', 'sia');
   const model = env('VACHANA_TTS_MODEL', 'vachana-voice-v2');
   const container = env('VACHANA_TTS_CONTAINER', 'wav');
-  const ttsRealtimeEnabled = env('ENABLE_TTS_REALTIME_WS', 'true').toLowerCase() === 'true';
-  const ttsRealtimeEndpoint = env('VACHANA_TTS_REALTIME_ENDPOINT', 'wss://api.vachana.ai/api/v1/tts');
-
-  if (ttsRealtimeEnabled) {
-    try {
-      const wsAudio = await synthesizeTTSRealtime({
-        endpoint: ttsRealtimeEndpoint,
-        apiKey,
-        text,
-        model,
-        sampleRate,
-        container,
-        voice,
-      });
-      if (wsAudio && wsAudio.length > 0) {
-        logInfo(`TTS realtime ws bytes=${wsAudio.length}`);
-        return wsAudio;
-      }
-      throw new Error('Realtime TTS returned empty audio');
-    } catch (error) {
-      logError(`TTS realtime failed: ${error.message}. Falling back to REST.`);
-    }
-  }
 
   const endpoints = candidateEndpoints(
     env('VACHANA_TTS_ENDPOINTS', ''),
@@ -477,7 +466,7 @@ async function synthesizeTTS(text) {
   throw new Error(`TTS failed for all endpoints: ${lastError}`);
 }
 
-function synthesizeTTSRealtime({ endpoint, apiKey, text, model, sampleRate, container, voice }) {
+function streamTTSRealtime({ endpoint, apiKey, text, model, sampleRate, container, voice, onChunk }) {
   return new Promise((resolve, reject) => {
     const url = String(endpoint || '').trim();
     if (!url) {
@@ -493,7 +482,8 @@ function synthesizeTTSRealtime({ endpoint, apiKey, text, model, sampleRate, cont
       },
     });
 
-    const chunks = [];
+    let chunkCount = 0;
+    let byteCount = 0;
     let closed = false;
     let opened = false;
 
@@ -523,7 +513,12 @@ function synthesizeTTSRealtime({ endpoint, apiKey, text, model, sampleRate, cont
 
     ws.on('message', (data, isBinary) => {
       if (isBinary || Buffer.isBuffer(data)) {
-        chunks.push(Buffer.from(data));
+        const chunk = Buffer.from(data);
+        chunkCount += 1;
+        byteCount += chunk.length;
+        if (typeof onChunk === 'function') {
+          onChunk(chunk);
+        }
         return;
       }
 
@@ -560,8 +555,8 @@ function synthesizeTTSRealtime({ endpoint, apiKey, text, model, sampleRate, cont
         return;
       }
 
-      const merged = Buffer.concat(chunks);
-      resolve(merged);
+      logInfo(`TTS realtime stream done chunks=${chunkCount} bytes=${byteCount}`);
+      resolve({ chunkCount, byteCount });
     });
   });
 }
@@ -625,12 +620,23 @@ async function processTranscriptQueue() {
     }
 
     const normalize = (s) => String(s || '').trim().toLowerCase();
+    const strictTargetOnly = env('STRICT_TARGET_ONLY_OUTPUT', 'true').toLowerCase() === 'true';
     if (normalize(translatedText) === normalize(item.text)
         && normalize(sourceLanguage) !== normalize(targetLanguage)) {
       logError(
         `Translation output equals source (possible failure). `
         + `source=${sourceLanguage}, target=${targetLanguage}, text="${item.text}"`
       );
+
+      if (strictTargetOnly) {
+        writeEvent('segment_skipped_source_like_output', {
+          segment_id: item.id,
+          source_language: sourceLanguage,
+          target_language: targetLanguage,
+          text: item.text,
+        });
+        continue;
+      }
     }
 
     logInfo(`TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`);
@@ -656,20 +662,112 @@ async function processTranscriptQueue() {
       sourceText: item.text,
     });
 
+    enqueueTtsJob({
+      segmentId: item.id,
+      translatedText,
+      event,
+    });
+  }
+
+  queueProcessing = false;
+}
+
+function enqueueTtsJob(job) {
+  ttsJobQueue.push(job);
+  processTtsJobQueue().catch((error) => {
+    logError(`TTS QUEUE ERROR: ${error.message}`);
+  });
+}
+
+async function processTtsJobQueue() {
+  if (ttsWorkerActive) {
+    return;
+  }
+
+  ttsWorkerActive = true;
+  while (ttsJobQueue.length > 0) {
+    const job = ttsJobQueue.shift();
+    const { segmentId, translatedText, event } = job;
+
     try {
-      const audioBuffer = await synthesizeTTS(translatedText);
-      event.sender.send('translated-audio', {
-        mimeType: 'audio/wav',
-        audioBase64: audioBuffer.toString('base64'),
-      });
-      writeEvent('segment_tts', { segment_id: item.id, audio_bytes: audioBuffer.length });
+      const ttsRealtimeEnabled = env('ENABLE_TTS_REALTIME_WS', 'true').toLowerCase() === 'true';
+      if (ttsRealtimeEnabled) {
+        const ttsRealtimeEndpoint = env('VACHANA_TTS_REALTIME_ENDPOINT', 'wss://api.vachana.ai/api/v1/tts');
+        const sampleRate = Number(env('VACHANA_TTS_SAMPLE_RATE', '16000'));
+        const voice = env('VACHANA_TTS_VOICE', 'sia');
+        const model = env('VACHANA_TTS_MODEL', 'vachana-voice-v2');
+        const container = env('VACHANA_TTS_CONTAINER', 'wav');
+        const apiKey = env('VACHANA_API_KEY_ID');
+
+        try {
+          const stats = await streamTTSRealtime({
+            endpoint: ttsRealtimeEndpoint,
+            apiKey,
+            text: translatedText,
+            model,
+            sampleRate,
+            container,
+            voice,
+            onChunk: (chunk) => {
+              event.sender.send('translated-audio-chunk', {
+                audioBase64: chunk.toString('base64'),
+                sampleRate,
+                numChannels: Number(env('VACHANA_TTS_NUM_CHANNELS', '1')),
+                sampleWidth: Number(env('VACHANA_TTS_SAMPLE_WIDTH', '2')),
+              });
+            },
+          });
+
+          event.sender.send('translated-audio-done', {
+            segmentId,
+            chunkCount: stats.chunkCount,
+            byteCount: stats.byteCount,
+          });
+
+          writeEvent('segment_tts', {
+            segment_id: segmentId,
+            audio_bytes: stats.byteCount,
+            chunk_count: stats.chunkCount,
+            mode: 'realtime-ws',
+          });
+        } catch (wsError) {
+          const restFallbackEnabled = env('ENABLE_TTS_REST_FALLBACK_ON_WS_ERROR', 'true').toLowerCase() === 'true';
+          if (!restFallbackEnabled) {
+            throw wsError;
+          }
+
+          logError(`TTS realtime failed; using REST fallback: ${wsError.message}`);
+          const audioBuffer = await synthesizeTTS(translatedText);
+          event.sender.send('translated-audio', {
+            mimeType: 'audio/wav',
+            audioBase64: audioBuffer.toString('base64'),
+          });
+          writeEvent('segment_tts', {
+            segment_id: segmentId,
+            audio_bytes: audioBuffer.length,
+            mode: 'rest-fallback',
+            realtime_error: wsError.message,
+          });
+        }
+      } else {
+        const audioBuffer = await synthesizeTTS(translatedText);
+        event.sender.send('translated-audio', {
+          mimeType: 'audio/wav',
+          audioBase64: audioBuffer.toString('base64'),
+        });
+        writeEvent('segment_tts', {
+          segment_id: segmentId,
+          audio_bytes: audioBuffer.length,
+          mode: 'rest',
+        });
+      }
     } catch (error) {
       logError(`PIPELINE ERROR (tts): ${error.message}`);
       sendStatus(event, translationRunning, `Pipeline error: ${error.message}`);
     }
   }
 
-  queueProcessing = false;
+  ttsWorkerActive = false;
 }
 
 function enqueueTranscript(event, msg) {
@@ -684,6 +782,16 @@ function enqueueTranscript(event, msg) {
     });
     return;
   }
+
+  const normalized = normalizeTranscriptForDedupe(msg.text);
+  if (normalized && normalized === lastEnqueuedTranscriptNorm) {
+    logInfo(`STT duplicate skipped: "${String(msg.text).trim()}"`);
+    writeEvent('segment_skipped_duplicate', {
+      raw_text: String(msg.text).trim(),
+    });
+    return;
+  }
+  lastEnqueuedTranscriptNorm = normalized;
 
   lastTranscriptAt = Date.now();
 
@@ -772,13 +880,17 @@ function startRestSttFallback(event, sourceLanguage) {
   sttMode = 'rest';
   restAudioBuffer = [];
   restInFlight = false;
+  restOverlapBuffer = Buffer.alloc(0);
 
   if (restFlushTimer) {
     clearInterval(restFlushTimer);
   }
 
-  const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', '48000'));
-  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', '2000'));
+  const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', '32000'));
+  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', '1200'));
+  const overlapMs = Number(env('VACHANA_STT_REST_OVERLAP_MS', '400'));
+  const sampleRate = Number(env('VACHANA_STT_SAMPLE_RATE', '16000'));
+  const overlapBytes = Math.max(0, Math.floor((overlapMs / 1000) * sampleRate * 2));
 
   restFlushTimer = setInterval(async () => {
     if (!translationRunning || sttMode !== 'rest' || restInFlight) {
@@ -790,8 +902,16 @@ function startRestSttFallback(event, sourceLanguage) {
       return;
     }
 
-    const chunk = Buffer.concat(restAudioBuffer);
+    const freshChunk = Buffer.concat(restAudioBuffer);
+    const chunk = restOverlapBuffer.length > 0
+      ? Buffer.concat([restOverlapBuffer, freshChunk])
+      : freshChunk;
     restAudioBuffer = [];
+    if (overlapBytes > 0 && chunk.length > overlapBytes) {
+      restOverlapBuffer = chunk.subarray(chunk.length - overlapBytes);
+    } else {
+      restOverlapBuffer = chunk;
+    }
     restInFlight = true;
 
     try {
@@ -851,14 +971,18 @@ function teardownPipeline() {
   activeConfig = null;
   sttMode = 'ws';
   restAudioBuffer = [];
+  restOverlapBuffer = Buffer.alloc(0);
   restInFlight = false;
   transcriptQueue = [];
   queueProcessing = false;
+  ttsJobQueue = [];
+  ttsWorkerActive = false;
   sessionArtifacts = null;
   activeSender = null;
   lastSpeechDetectedAt = 0;
   lastTranscriptAt = 0;
   wsHealthFailoverTriggered = false;
+  lastEnqueuedTranscriptNorm = '';
 
   if (restFlushTimer) {
     clearInterval(restFlushTimer);
@@ -912,6 +1036,7 @@ ipcMain.on('start-translation', (event, config = {}) => {
   audioFramesForwarded = 0;
   audioFramesDropped = 0;
   segmentCounter = 0;
+  lastEnqueuedTranscriptNorm = '';
   lastTranscriptAt = Date.now();
   lastSpeechDetectedAt = 0;
   wsHealthFailoverTriggered = false;
@@ -924,6 +1049,15 @@ ipcMain.on('start-translation', (event, config = {}) => {
       logInfo(`AUDIO frames forwarded=${audioFramesForwarded}, dropped=${audioFramesDropped}, queue=${transcriptQueue.length}`);
     }
   }, 5000);
+
+  const sttModePref = env('VACHANA_STT_MODE', 'rest').toLowerCase();
+  if (sttModePref === 'rest') {
+    translationRunning = true;
+    sttMode = 'rest';
+    startRestSttFallback(event, sourceLanguage);
+    sendStatus(event, true, `Pipeline started in REST continuous mode (${sourceLanguage} -> ${targetLanguage}).`);
+    return;
+  }
 
   connectSTT(event, sourceLanguage)
     .then(() => {
