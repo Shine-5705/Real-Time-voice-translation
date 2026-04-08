@@ -4,8 +4,10 @@ __pycache__/
 *$py.class
 
 # C extensions
+
 *.so
 gnani-translator-desktop\node_modules
+Video dubbing Gnani
 # Distribution / packaging
 .Python
 build/
