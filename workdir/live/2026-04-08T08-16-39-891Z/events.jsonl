@@ -1,0 +1,27 @@
+{"ts":"2026-04-08T08:16:39.897Z","event":"session_start","source_language":"en-IN","target_language":"hi-IN"}
+{"ts":"2026-04-08T08:16:40.349Z","event":"status","running":true,"message":"Pipeline started (en-IN -> hi-IN)."}
+{"ts":"2026-04-08T08:16:40.354Z","event":"status","running":true,"message":"Connected to STT. Speak now."}
+{"ts":"2026-04-08T08:16:52.360Z","event":"status","running":true,"message":"Realtime STT unavailable. Using REST STT fallback."}
+{"ts":"2026-04-08T08:16:52.361Z","event":"status","running":true,"message":"Auto-failover: switched STT from WebSocket to REST due to no transcript events."}
+{"ts":"2026-04-08T08:16:54.365Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:16:56.366Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:16:56.578Z","event":"segment_received","segment_id":1,"source_text":".","detected_language":"en-IN","latency":"rest"}
+{"ts":"2026-04-08T08:16:57.262Z","event":"segment_translated","segment_id":1,"source_language":"en-IN","target_language":"hi-IN","source_text":".","translated_text":"."}
+{"ts":"2026-04-08T08:16:58.367Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:00.379Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:02.384Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:04.398Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:06.399Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:08.413Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:10.422Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:12.435Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:14.439Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:16.454Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:17.654Z","event":"segment_tts","segment_id":1,"audio_bytes":15404}
+{"ts":"2026-04-08T08:17:17.656Z","event":"segment_received","segment_id":2,"source_text":".","detected_language":"en-IN","latency":"rest"}
+{"ts":"2026-04-08T08:17:18.467Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:18.913Z","event":"segment_translated","segment_id":2,"source_language":"en-IN","target_language":"hi-IN","source_text":".","translated_text":"।"}
+{"ts":"2026-04-08T08:17:20.468Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:22.469Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:24.478Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-08T08:17:26.479Z","event":"status","running":true,"message":"REST STT processing segment..."}
