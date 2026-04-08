@@ -14,4 +14,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTranslatedAudio: (callback) => {
     ipcRenderer.on('translated-audio', (_event, payload) => callback(payload));
   },
+  onTranslatedAudioChunk: (callback) => {
+    ipcRenderer.on('translated-audio-chunk', (_event, payload) => callback(payload));
+  },
+  onTranslatedAudioDone: (callback) => {
+    ipcRenderer.on('translated-audio-done', (_event, payload) => callback(payload));
+  },
 });

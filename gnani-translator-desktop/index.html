@@ -51,7 +51,7 @@
 
   <p style="font-size: 13px; margin: 8px 0 0 0; text-align: left; width: 80%; margin-left: auto; margin-right: auto;">
     <label>
-      <input type="checkbox" id="passthroughToggle" checked>
+      <input type="checkbox" id="passthroughToggle">
       Mic passthrough to VB-CABLE (test mode)
     </label>
   </p>
@@ -63,10 +63,10 @@
   <p style="font-size: 13px; color: #333; line-height: 1.5; text-align: left; margin-top: 16px;">
     Teams/Meet integration steps:<br>
     1. Install VB-CABLE (Windows) or BlackHole (macOS).<br>
-    2. Pick your physical microphone and a virtual output device here.<br>
-    3. Click Start Translation to enable local passthrough.<br>
-    4. In Teams/Meet settings, set Microphone to CABLE Output/BlackHole.<br>
-    5. Keep Speaker on your normal headset.
+    2. In this app, Input Microphone must be your physical mic (not CABLE Output).<br>
+    3. In this app, Output Device should be CABLE Input/BlackHole.<br>
+    4. Click Start Translation.<br>
+    5. In Teams/Meet settings, set Microphone to CABLE Output/BlackHole and keep Speaker on your headset.
   </p>
 
   <script src="renderer.js"></script>

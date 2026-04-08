@@ -1,0 +1,10 @@
+{"ts":"2026-04-08T09:56:15.831Z","event":"session_start","source_language":"en-IN","target_language":"hi-IN"}
+{"ts":"2026-04-08T09:56:16.240Z","event":"status","running":true,"message":"Pipeline started (en-IN -> hi-IN)."}
+{"ts":"2026-04-08T09:56:16.246Z","event":"status","running":true,"message":"Connected to STT. Speak now."}
+{"ts":"2026-04-08T09:56:19.728Z","event":"status","running":true,"message":"Processing speech segment..."}
+{"ts":"2026-04-08T09:56:19.743Z","event":"segment_received","segment_id":1,"source_text":"am i audible to you","detected_language":"en","latency":176}
+{"ts":"2026-04-08T09:56:21.128Z","event":"segment_translated","segment_id":1,"source_language":"en-IN","target_language":"hi-IN","source_text":"am i audible to you","translated_text":"क्या मैं आप तक सुनाई दे रहा हूँ?"}
+{"ts":"2026-04-08T09:56:34.300Z","event":"status","running":true,"message":"Realtime STT unavailable. Using REST STT fallback."}
+{"ts":"2026-04-08T09:56:34.301Z","event":"status","running":true,"message":"Auto-failover: switched STT from WebSocket to REST due to no transcript events."}
+{"ts":"2026-04-08T09:56:42.380Z","event":"segment_tts","segment_id":1,"audio_bytes":61484}
+{"ts":"2026-04-08T09:56:43.956Z","event":"status","running":true,"message":"REST STT processing segment..."}
