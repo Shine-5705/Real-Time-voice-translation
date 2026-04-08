@@ -1,0 +1,17 @@
+{
+  "name": "gnani-translator-desktop",
+  "version": "1.0.0",
+  "description": "Basic Gnani Voice Translator Desktop App",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^41.1.1"
+  }
+}
