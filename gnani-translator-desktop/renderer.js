@@ -6,8 +6,10 @@ const outputSelect = document.getElementById('outputSelect');
 const sourceLangSelect = document.getElementById('sourceLang');
 const targetLangSelect = document.getElementById('targetLang');
 const transcriptBox = document.getElementById('transcriptBox');
+const passthroughToggle = document.getElementById('passthroughToggle');
 
 let inputStream = null;
+let monitorAudio = null;
 let audioContext = null;
 let sourceNode = null;
 let processorNode = null;
@@ -16,6 +18,11 @@ let pcmBuffer = new Int16Array(0);
 let selectedOutputSinkId = '';
 const playbackQueue = [];
 let playbackActive = false;
+let sttFrameQueue = [];
+let sttSendTimer = null;
+let lastMicTelemetryTs = 0;
+const TARGET_SAMPLE_RATE = 16000;
+const PREAMP_GAIN = 1.8;
 
 const LANGUAGES = [
   ['bn-IN', 'Bengali'],
@@ -74,6 +81,39 @@ function toInt16(floatArray) {
   return int16;
 }
 
+function applyGain(floatArray, gain) {
+  if (gain === 1) {
+    return floatArray;
+  }
+  const out = new Float32Array(floatArray.length);
+  for (let i = 0; i < floatArray.length; i++) {
+    const v = floatArray[i] * gain;
+    out[i] = Math.max(-1, Math.min(1, v));
+  }
+  return out;
+}
+
+function resampleTo16k(input, inputSampleRate) {
+  if (!inputSampleRate || inputSampleRate === TARGET_SAMPLE_RATE) {
+    return input;
+  }
+
+  const ratio = inputSampleRate / TARGET_SAMPLE_RATE;
+  const newLength = Math.max(1, Math.floor(input.length / ratio));
+  const output = new Float32Array(newLength);
+
+  // Linear interpolation resampler; lightweight and good enough for STT input.
+  for (let i = 0; i < newLength; i++) {
+    const srcPos = i * ratio;
+    const left = Math.floor(srcPos);
+    const right = Math.min(left + 1, input.length - 1);
+    const frac = srcPos - left;
+    output[i] = input[left] * (1 - frac) + input[right] * frac;
+  }
+
+  return output;
+}
+
 function concatInt16(a, b) {
   const merged = new Int16Array(a.length + b.length);
   merged.set(a, 0);
@@ -87,8 +127,54 @@ function sendPCMToSTT(newPCM) {
     const frame = pcmBuffer.slice(0, 512);
     pcmBuffer = pcmBuffer.slice(512);
     const bytes = new Uint8Array(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength));
-    window.electronAPI.sendAudioChunk(bytes);
+    sttFrameQueue.push(bytes);
   }
+}
+
+function computeRms(floatArray) {
+  let sumSquares = 0;
+  for (let i = 0; i < floatArray.length; i++) {
+    sumSquares += floatArray[i] * floatArray[i];
+  }
+  return Math.sqrt(sumSquares / Math.max(1, floatArray.length));
+}
+
+function emitMicTelemetry(floatArray) {
+  const now = performance.now();
+  if (now - lastMicTelemetryTs < 1000) {
+    return;
+  }
+  lastMicTelemetryTs = now;
+
+  const rms = computeRms(floatArray);
+  const speaking = rms > 0.01;
+  window.electronAPI.sendMicActivity({
+    rms,
+    speaking,
+    queuedFrames: sttFrameQueue.length,
+    sourceLang: sourceLangSelect.value,
+    targetLang: targetLangSelect.value,
+  });
+}
+
+function startPacedSttSender() {
+  stopPacedSttSender();
+  // Vachana STT requires steady 32ms frames (512 samples @16kHz => 1024 bytes).
+  sttSendTimer = setInterval(() => {
+    if (sttFrameQueue.length === 0) {
+      return;
+    }
+    const frame = sttFrameQueue.shift();
+    window.electronAPI.sendAudioChunk(frame);
+  }, 32);
+}
+
+function stopPacedSttSender() {
+  if (sttSendTimer) {
+    clearInterval(sttSendTimer);
+    sttSendTimer = null;
+  }
+  sttFrameQueue = [];
 }
 
 function base64ToBlob(base64, mimeType) {
@@ -134,6 +220,8 @@ function isVirtualLabel(label) {
 }
 
 function teardownAudioGraph() {
+  stopPacedSttSender();
+
   if (processorNode) {
     processorNode.disconnect();
     processorNode.onaudioprocess = null;
@@ -152,6 +240,12 @@ function teardownAudioGraph() {
 
   silentGainNode = null;
 
+  if (monitorAudio) {
+    monitorAudio.pause();
+    monitorAudio.srcObject = null;
+    monitorAudio = null;
+  }
+
   if (inputStream) {
     inputStream.getTracks().forEach((t) => t.stop());
     inputStream = null;
@@ -162,9 +256,35 @@ function teardownAudioGraph() {
   playbackActive = false;
 }
 
+async function startMonitorPassthrough(outputDeviceId) {
+  if (!inputStream) {
+    return;
+  }
+
+  if (monitorAudio) {
+    monitorAudio.pause();
+    monitorAudio.srcObject = null;
+    monitorAudio = null;
+  }
+
+  monitorAudio = new Audio();
+  monitorAudio.autoplay = false;
+  monitorAudio.muted = false;
+  monitorAudio.volume = 1.0;
+  monitorAudio.srcObject = inputStream;
+
+  if (typeof monitorAudio.setSinkId !== 'function') {
+    throw new Error('Output routing not supported (setSinkId unavailable)');
+  }
+
+  await monitorAudio.setSinkId(outputDeviceId);
+  await monitorAudio.play();
+}
+
 async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
   teardownAudioGraph();
   selectedOutputSinkId = outputDeviceId;
+  startPacedSttSender();
 
   inputStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -185,8 +305,12 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
   silentGainNode.gain.value = 0;
 
   processorNode.onaudioprocess = (e) => {
+    const inputRate = e.inputBuffer.sampleRate || audioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
-    sendPCMToSTT(toInt16(channel));
+    const resampled = resampleTo16k(channel, inputRate);
+    const boosted = applyGain(resampled, PREAMP_GAIN);
+    emitMicTelemetry(boosted);
+    sendPCMToSTT(toInt16(boosted));
   };
 
   // Keep callback running while preventing local speaker feedback.
@@ -196,6 +320,9 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
 
   // Do not pass raw mic to VB-CABLE in translation mode.
   // Only translated TTS chunks are routed to selected output sink.
+  if (passthroughToggle && passthroughToggle.checked) {
+    await startMonitorPassthrough(outputDeviceId);
+  }
 }
 
 function validateLanguages() {
@@ -234,7 +361,11 @@ startBtn.addEventListener('click', () => {
       stopBtn.disabled = false;
       clearTranscript();
       appendTranscriptLine('Listening for speech...', 'line-muted');
-      statusEl.textContent = 'Status: Realtime translation active. In app choose CABLE Input; in Teams choose CABLE Output as microphone.';
+      if (passthroughToggle && passthroughToggle.checked) {
+        statusEl.textContent = 'Status: Realtime translation active + mic passthrough test mode ON. Teams Mic must be CABLE Output.';
+      } else {
+        statusEl.textContent = 'Status: Realtime translation active. Teams Mic must be CABLE Output.';
+      }
     })
     .catch((err) => {
       console.error(err);

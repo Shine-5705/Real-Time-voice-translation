@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const WebSocket = require('ws');
 const dotenv = require('dotenv');
 
@@ -16,6 +17,16 @@ let restInFlight = false;
 let audioFramesForwarded = 0;
 let audioFramesDropped = 0;
 let metricsTimer = null;
+let segmentCounter = 0;
+let transcriptQueue = [];
+let queueProcessing = false;
+let sessionArtifacts = null;
+let lastMicActivityLogTs = 0;
+let activeSender = null;
+let lastSpeechDetectedAt = 0;
+let lastTranscriptAt = 0;
+let sttHealthTimer = null;
+let wsHealthFailoverTriggered = false;
 
 function nowISO() {
   return new Date().toISOString();
@@ -33,8 +44,107 @@ function env(name, fallback = '') {
   return process.env[name] || fallback;
 }
 
+function getWorkspaceRoot() {
+  return path.join(__dirname, '..');
+}
+
+function sessionDirNow() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return path.join(getWorkspaceRoot(), 'workdir', 'live', stamp);
+}
+
+function appendLine(filePath, line) {
+  try {
+    fs.appendFileSync(filePath, `${line}\n`, 'utf8');
+  } catch (err) {
+    logError(`Failed writing ${filePath}: ${err.message}`);
+  }
+}
+
+function initSessionArtifacts(sourceLanguage, targetLanguage) {
+  const dir = sessionDirNow();
+  fs.mkdirSync(dir, { recursive: true });
+
+  sessionArtifacts = {
+    dir,
+    sourceLogPath: path.join(dir, 'source_transcript.log'),
+    spokenTextPath: path.join(dir, 'spoken_text.txt'),
+    translatedLogPath: path.join(dir, 'translated_transcript.log'),
+    eventsPath: path.join(dir, 'events.jsonl'),
+    sourceLanguage,
+    targetLanguage,
+  };
+
+  fs.writeFileSync(sessionArtifacts.sourceLogPath, '', 'utf8');
+  fs.writeFileSync(sessionArtifacts.spokenTextPath, '', 'utf8');
+  fs.writeFileSync(sessionArtifacts.translatedLogPath, '', 'utf8');
+  fs.writeFileSync(sessionArtifacts.eventsPath, '', 'utf8');
+
+  logInfo(`Session log directory: ${dir}`);
+}
+
+function writeEvent(eventType, data) {
+  if (!sessionArtifacts) {
+    return;
+  }
+  appendLine(
+    sessionArtifacts.eventsPath,
+    JSON.stringify({ ts: nowISO(), event: eventType, ...data })
+  );
+}
+
+function candidateEndpoints(csvValue, singleValue, defaults) {
+  const out = [];
+
+  const add = (value) => {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) {
+      return;
+    }
+    let normalized = trimmed;
+    if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
+      if (!normalized.startsWith('/')) {
+        normalized = `/${normalized}`;
+      }
+    }
+    if (!out.includes(normalized)) {
+      out.push(normalized);
+    }
+  };
+
+  let explicit = false;
+  for (const part of String(csvValue || '').split(',')) {
+    if (part.trim()) {
+      explicit = true;
+      add(part);
+    }
+  }
+
+  if (String(singleValue || '').trim()) {
+    explicit = true;
+    add(singleValue);
+  }
+
+  if (!explicit) {
+    for (const fallback of defaults) {
+      add(fallback);
+    }
+  }
+
+  return out;
+}
+
+function buildUrl(endpoint) {
+  const baseUrl = env('VACHANA_BASE_URL', 'https://api.vachana.ai');
+  if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
+    return endpoint;
+  }
+  return `${baseUrl}${endpoint}`;
+}
+
 function sendStatus(event, running, message) {
   logInfo(`STATUS running=${running} :: ${message}`);
+  writeEvent('status', { running, message });
   event.sender.send('translation-status', { running, message });
 }
 
@@ -49,8 +159,61 @@ function parseTranslationText(payload) {
     payload.translatedText ||
     payload.text ||
     payload.output ||
+    (payload.data && (payload.data.translated_text || payload.data.text)) ||
     ''
   );
+}
+
+function isMeaningfulTranscript(text) {
+  const value = String(text || '').trim();
+  if (!value) {
+    return false;
+  }
+
+  // Accept only segments that contain at least one letter or number.
+  // This avoids translating pure punctuation/noise like "." or "।".
+  return /[\p{L}\p{N}]/u.test(value);
+}
+
+function normalizeLangCode(langCode) {
+  if (!langCode) {
+    return 'en';
+  }
+
+  const lower = String(langCode).toLowerCase();
+  if (lower === 'en-hi-in-latn') {
+    return 'hi';
+  }
+
+  const parts = lower.split('-');
+  return parts[0] || 'en';
+}
+
+function toVachanaLanguageCode(langCode) {
+  const normalized = String(langCode || '').trim();
+  if (!normalized) {
+    return 'en-IN';
+  }
+
+  const lower = normalized.toLowerCase();
+  if (lower.includes('-in') || lower === 'en-hi-in-latn') {
+    return normalized;
+  }
+
+  const map = {
+    en: 'en-IN',
+    hi: 'hi-IN',
+    bn: 'bn-IN',
+    gu: 'gu-IN',
+    kn: 'kn-IN',
+    ml: 'ml-IN',
+    mr: 'mr-IN',
+    pa: 'pa-IN',
+    ta: 'ta-IN',
+    te: 'te-IN',
+  };
+
+  return map[lower] || normalized;
 }
 
 function buildWavFromPcm16(pcmBytes, sampleRate = 16000, channels = 1, bitsPerSample = 16) {
@@ -78,92 +241,62 @@ function buildWavFromPcm16(pcmBytes, sampleRate = 16000, channels = 1, bitsPerSa
 }
 
 async function transcribeViaRest(pcmBytes, sourceLanguage) {
-  const baseUrl = env('VACHANA_BASE_URL', 'https://api.vachana.ai');
-  const sttEndpoint = env('VACHANA_STT_ENDPOINT', '/stt/v3');
   const apiKey = env('VACHANA_API_KEY_ID');
+  const endpoints = candidateEndpoints(
+    env('VACHANA_STT_ENDPOINTS', ''),
+    env('VACHANA_STT_ENDPOINT', '/stt/v3'),
+    ['/stt/v3', '/stt/rest', '/stt', '/stt/transcribe']
+  );
 
   const wav = buildWavFromPcm16(pcmBytes, Number(env('VACHANA_STT_SAMPLE_RATE', '16000')));
-  const form = new FormData();
-  form.append('audio_file', new Blob([wav], { type: 'audio/wav' }), 'segment.wav');
-  form.append('language_code', sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN'));
+  const language = sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN');
 
-  const response = await fetch(`${baseUrl}${sttEndpoint}`, {
-    method: 'POST',
-    headers: {
-      'X-API-Key-ID': apiKey,
-    },
-    body: form,
-  });
-
-  if (!response.ok) {
-    throw new Error(`STT REST failed (${response.status})`);
-  }
-
-  const payload = await response.json();
-  return payload.transcript || '';
-}
-
-function startRestSttFallback(event, sourceLanguage) {
-  sttMode = 'rest';
-  restAudioBuffer = [];
-  restInFlight = false;
-
-  if (restFlushTimer) {
-    clearInterval(restFlushTimer);
-  }
-
-  const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', '48000')); // ~1.5s @16kHz/16-bit mono
-  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', '2000'));
-
-  restFlushTimer = setInterval(async () => {
-    if (!translationRunning || sttMode !== 'rest' || restInFlight) {
-      return;
-    }
-
-    const totalBytes = restAudioBuffer.reduce((sum, b) => sum + b.length, 0);
-    if (totalBytes < minBytesPerFlush) {
-      return;
-    }
-
-    const chunk = Buffer.concat(restAudioBuffer);
-    restAudioBuffer = [];
-    restInFlight = true;
+  let lastError = 'unknown error';
+  for (const endpoint of endpoints) {
+    const url = buildUrl(endpoint);
+    const form = new FormData();
+    form.append('audio_file', new Blob([wav], { type: 'audio/wav' }), 'segment.wav');
+    form.append('language_code', language);
+    form.append('preferred_language', language);
 
     try {
-      sendStatus(event, true, 'REST STT processing segment...');
-      const text = await transcribeViaRest(chunk, sourceLanguage);
-      if (text && text.trim()) {
-        handleTranscript(event, {
-          type: 'transcript',
-          text,
-          detected_language: sourceLanguage,
-          latency: 'rest',
-        });
+      logInfo(`STT REST request endpoint=${url}`);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'X-API-Key-ID': apiKey,
+        },
+        body: form,
+      });
+
+      if (response.status === 404) {
+        logError(`STT REST endpoint not found: ${url}`);
+        lastError = `404 at ${url}`;
+        continue;
       }
-    } catch (error) {
-      logError(`STT REST ERROR: ${error.message}`);
-      sendStatus(event, true, `STT REST error: ${error.message}`);
-    } finally {
-      restInFlight = false;
+
+      if (!response.ok) {
+        const body = await response.text();
+        lastError = `status=${response.status} endpoint=${url} body=${body.slice(0, 300)}`;
+        logError(`STT REST error ${lastError}`);
+        continue;
+      }
+
+      const payload = await response.json();
+      const transcript = String(
+        payload.transcript || payload.text ||
+        (payload.data && (payload.data.transcript || payload.data.text)) ||
+        ''
+      ).trim();
+      logInfo(`STT REST parsed endpoint=${url} transcript_len=${transcript.length}`);
+      return transcript;
+    } catch (err) {
+      lastError = err.message;
+      logError(`STT REST exception endpoint=${url} error=${err.message}`);
     }
-  }, flushEveryMs);
-
-  logInfo('STT mode switched to REST fallback');
-  sendStatus(event, true, 'Realtime STT unavailable. Using REST STT fallback.');
-}
-
-function normalizeLangCode(langCode) {
-  if (!langCode) {
-    return 'en';
   }
 
-  const lower = String(langCode).toLowerCase();
-  if (lower === 'en-hi-in-latn') {
-    return 'hi';
-  }
-
-  const parts = lower.split('-');
-  return parts[0] || 'en';
+  throw new Error(`STT REST failed for all endpoints: ${lastError}`);
 }
 
 async function translateViaPublicFallback(text, sourceLanguage, targetLanguage) {
@@ -193,162 +326,381 @@ async function translateText(text, sourceLanguage, targetLanguage) {
     return '';
   }
 
-  const baseUrl = env('VACHANA_BASE_URL', 'https://api.vachana.ai');
-  const translateEndpoint = env('VACHANA_TRANSLATE_ENDPOINT', '/api/v1/tts/translate');
   const apiKey = env('VACHANA_API_KEY_ID');
+  const endpoints = candidateEndpoints(
+    env('VACHANA_TRANSLATE_ENDPOINTS', ''),
+    env('VACHANA_TRANSLATE_ENDPOINT', '/api/v1/tts/translate'),
+    ['/api/v1/translate', '/translate', '/api/v1/translation', '/api/v1/tts/translate']
+  );
 
-  try {
-    const response = await fetch(`${baseUrl}${translateEndpoint}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key-ID': apiKey,
-      },
-      body: JSON.stringify({
-        text,
-        source_language: sourceLanguage,
-        target_language: targetLanguage,
-        source: sourceLanguage,
-        target: targetLanguage,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Translate failed (${response.status})`);
-    }
-
-    const payload = await response.json();
-    const translated = parseTranslationText(payload);
-    if (translated) {
-      logInfo('Primary translation endpoint returned a result.');
-      return translated;
-    }
-    throw new Error('Translate response did not include translated text');
-  } catch (error) {
-    const fallbackEnabled = env('ENABLE_PUBLIC_TRANSLATE_FALLBACK', 'true').toLowerCase() === 'true';
-    if (!fallbackEnabled) {
-      throw error;
-    }
-
-    logInfo(`Primary translate failed (${error.message}). Trying fallback translator.`);
+  let lastError = 'unknown';
+  for (const endpoint of endpoints) {
+    const url = buildUrl(endpoint);
     try {
-      const fallbackTranslated = await translateViaPublicFallback(text, sourceLanguage, targetLanguage);
-      if (fallbackTranslated) {
-        logInfo('Fallback translator returned a result.');
+      logInfo(`Translate request endpoint=${url}`);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key-ID': apiKey,
+        },
+        body: JSON.stringify({
+          text,
+          source_language: sourceLanguage,
+          target_language: targetLanguage,
+          source: sourceLanguage,
+          target: targetLanguage,
+        }),
+      });
+
+      if (response.status === 404) {
+        lastError = `404 at ${url}`;
+        logError(`Translate endpoint not found: ${url}`);
+        continue;
       }
-      return fallbackTranslated;
-    } catch (fallbackError) {
-      logError(`Fallback translate failed: ${fallbackError.message}`);
-      throw fallbackError;
+
+      if (!response.ok) {
+        const body = await response.text();
+        lastError = `status=${response.status} endpoint=${url} body=${body.slice(0, 300)}`;
+        logError(`Translate API error ${lastError}`);
+        continue;
+      }
+
+      const payload = await response.json();
+      const translated = parseTranslationText(payload);
+      if (translated) {
+        logInfo(`Translate parsed endpoint=${url} translated_len=${translated.length}`);
+        return translated;
+      }
+
+      lastError = `No translated text field at ${url}`;
+      logError(lastError);
+    } catch (error) {
+      lastError = `${error.message}`;
+      logError(`Translate exception endpoint=${url} error=${error.message}`);
     }
   }
+
+  const fallbackEnabled = env('ENABLE_PUBLIC_TRANSLATE_FALLBACK', 'true').toLowerCase() === 'true';
+  if (!fallbackEnabled) {
+    throw new Error(`Translate failed for all endpoints: ${lastError}`);
+  }
+
+  logInfo(`Primary translate failed (${lastError}). Trying fallback translator.`);
+  return translateViaPublicFallback(text, sourceLanguage, targetLanguage);
 }
 
 async function synthesizeTTS(text) {
-  const baseUrl = env('VACHANA_BASE_URL', 'https://api.vachana.ai');
-  const ttsEndpoint = env('VACHANA_TTS_ENDPOINT', '/api/v1/tts/inference');
   const apiKey = env('VACHANA_API_KEY_ID');
   const sampleRate = Number(env('VACHANA_TTS_SAMPLE_RATE', '16000'));
   const voice = env('VACHANA_TTS_VOICE', 'sia');
   const model = env('VACHANA_TTS_MODEL', 'vachana-voice-v2');
   const container = env('VACHANA_TTS_CONTAINER', 'wav');
+  const ttsRealtimeEnabled = env('ENABLE_TTS_REALTIME_WS', 'true').toLowerCase() === 'true';
+  const ttsRealtimeEndpoint = env('VACHANA_TTS_REALTIME_ENDPOINT', 'wss://api.vachana.ai/api/v1/tts');
 
-  const response = await fetch(`${baseUrl}${ttsEndpoint}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-Key-ID': apiKey,
-    },
-    body: JSON.stringify({
-      text,
-      model,
-      voice,
-      audio_config: {
-        sample_rate: sampleRate,
-        encoding: 'linear_pcm',
+  if (ttsRealtimeEnabled) {
+    try {
+      const wsAudio = await synthesizeTTSRealtime({
+        endpoint: ttsRealtimeEndpoint,
+        apiKey,
+        text,
+        model,
+        sampleRate,
         container,
-        num_channels: 1,
-        sample_width: 2,
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`TTS failed (${response.status})`);
+        voice,
+      });
+      if (wsAudio && wsAudio.length > 0) {
+        logInfo(`TTS realtime ws bytes=${wsAudio.length}`);
+        return wsAudio;
+      }
+      throw new Error('Realtime TTS returned empty audio');
+    } catch (error) {
+      logError(`TTS realtime failed: ${error.message}. Falling back to REST.`);
+    }
   }
 
-  const arr = await response.arrayBuffer();
-  return Buffer.from(arr);
-}
+  const endpoints = candidateEndpoints(
+    env('VACHANA_TTS_ENDPOINTS', ''),
+    env('VACHANA_TTS_ENDPOINT', '/api/v1/tts/inference'),
+    ['/api/v1/tts/inference', '/api/v1/tts/rest', '/tts/rest', '/tts']
+  );
 
-function handleTranscript(event, msg) {
-  if (!msg || msg.type !== 'transcript' || !msg.text) {
-    return;
-  }
-
-  const detectedLang = msg.detected_language || activeConfig?.sourceLanguage || 'unknown';
-  const sttLatency = msg.latency ?? 'n/a';
-  logInfo(`STT(${detectedLang}, latency=${sttLatency}ms): ${msg.text}`);
-
-  event.sender.send('transcript', {
-    text: msg.text,
-    detectedLanguage: detectedLang,
-    latency: msg.latency,
-  });
-
-  const sourceLanguage = activeConfig?.sourceLanguage;
-  const targetLanguage = activeConfig?.targetLanguage;
-  if (!sourceLanguage || !targetLanguage) {
-    return;
-  }
-
-  const fallbackToSource = env('FALLBACK_TO_SOURCE_TEXT_ON_TRANSLATE_ERROR', 'true').toLowerCase() === 'true';
-
-  translateText(msg.text, sourceLanguage, targetLanguage)
-    .catch((error) => {
-      if (fallbackToSource) {
-        logError(`TRANSLATE ERROR -> using source text as fallback: ${error.message}`);
-        return msg.text;
-      }
-      throw error;
-    })
-    .then((translatedText) => {
-      if (!translatedText || !translatedText.trim()) {
-        return null;
-      }
-
-      const normalize = (s) => String(s || '').trim().toLowerCase();
-      if (normalize(translatedText) === normalize(msg.text)
-          && normalize(sourceLanguage) !== normalize(targetLanguage)) {
-        logError(
-          `Translation output equals source (possible translation failure). `
-          + `source=${sourceLanguage}, target=${targetLanguage}, text="${msg.text}"`
-        );
-      }
-
-      logInfo(`TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`);
-
-      event.sender.send('transcript', {
-        text: translatedText,
-        translated: true,
-        sourceText: msg.text,
+  let lastError = 'unknown';
+  for (const endpoint of endpoints) {
+    const url = buildUrl(endpoint);
+    try {
+      logInfo(`TTS request endpoint=${url}`);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key-ID': apiKey,
+        },
+        body: JSON.stringify({
+          text,
+          model,
+          voice,
+          audio_config: {
+            sample_rate: sampleRate,
+            encoding: 'linear_pcm',
+            container,
+            num_channels: 1,
+            sample_width: 2,
+          },
+        }),
       });
 
-      return synthesizeTTS(translatedText);
-    })
-    .then((audioBuffer) => {
-      if (!audioBuffer) {
+      if (response.status === 404) {
+        lastError = `404 at ${url}`;
+        logError(`TTS endpoint not found: ${url}`);
+        continue;
+      }
+
+      if (!response.ok) {
+        const body = await response.text();
+        lastError = `status=${response.status} endpoint=${url} body=${body.slice(0, 300)}`;
+        logError(`TTS API error ${lastError}`);
+        continue;
+      }
+
+      const arr = await response.arrayBuffer();
+      const out = Buffer.from(arr);
+      logInfo(`TTS parsed endpoint=${url} bytes=${out.length}`);
+      return out;
+    } catch (error) {
+      lastError = `${error.message}`;
+      logError(`TTS exception endpoint=${url} error=${error.message}`);
+    }
+  }
+
+  throw new Error(`TTS failed for all endpoints: ${lastError}`);
+}
+
+function synthesizeTTSRealtime({ endpoint, apiKey, text, model, sampleRate, container, voice }) {
+  return new Promise((resolve, reject) => {
+    const url = String(endpoint || '').trim();
+    if (!url) {
+      reject(new Error('Realtime TTS endpoint missing'));
+      return;
+    }
+
+    logInfo(`TTS realtime connect endpoint=${url}`);
+    const ws = new WebSocket(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key-ID': apiKey,
+      },
+    });
+
+    const chunks = [];
+    let closed = false;
+    let opened = false;
+
+    const timeoutMs = Number(env('VACHANA_TTS_REALTIME_TIMEOUT_MS', '20000'));
+    const timer = setTimeout(() => {
+      if (!closed) {
+        try { ws.close(); } catch (_e) { }
+        reject(new Error(`Realtime TTS timeout after ${timeoutMs}ms`));
+      }
+    }, timeoutMs);
+
+    ws.on('open', () => {
+      opened = true;
+      ws.send(JSON.stringify({
+        text,
+        model,
+        voice,
+        audio_config: {
+          sample_rate: sampleRate,
+          encoding: 'linear_pcm',
+          num_channels: Number(env('VACHANA_TTS_NUM_CHANNELS', '1')),
+          sample_width: Number(env('VACHANA_TTS_SAMPLE_WIDTH', '2')),
+          container,
+        },
+      }));
+    });
+
+    ws.on('message', (data, isBinary) => {
+      if (isBinary || Buffer.isBuffer(data)) {
+        chunks.push(Buffer.from(data));
         return;
       }
+
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'error' || msg.error) {
+          throw new Error(msg.message || msg.error || 'Realtime TTS server error');
+        }
+      } catch (err) {
+        if (String(err.message).includes('Realtime TTS server error')) {
+          clearTimeout(timer);
+          closed = true;
+          try { ws.close(); } catch (_e) { }
+          reject(err);
+        }
+      }
+    });
+
+    ws.on('error', (error) => {
+      clearTimeout(timer);
+      closed = true;
+      reject(error);
+    });
+
+    ws.on('close', () => {
+      clearTimeout(timer);
+      if (closed) {
+        return;
+      }
+      closed = true;
+
+      if (!opened) {
+        reject(new Error('Realtime TTS websocket closed before open'));
+        return;
+      }
+
+      const merged = Buffer.concat(chunks);
+      resolve(merged);
+    });
+  });
+}
+
+async function processTranscriptQueue() {
+  if (queueProcessing || transcriptQueue.length === 0) {
+    return;
+  }
+  queueProcessing = true;
+
+  while (transcriptQueue.length > 0) {
+    const item = transcriptQueue.shift();
+    const event = item.event;
+
+    logInfo(`STT(${item.detectedLanguage}, latency=${item.latency}ms): ${item.text}`);
+
+    if (sessionArtifacts) {
+      appendLine(sessionArtifacts.sourceLogPath, `[${item.receivedAt}] seg=${item.id} ${item.detectedLanguage} :: ${item.text}`);
+      appendLine(sessionArtifacts.spokenTextPath, item.text);
+    }
+
+    writeEvent('segment_received', {
+      segment_id: item.id,
+      source_text: item.text,
+      detected_language: item.detectedLanguage,
+      latency: item.latency,
+    });
+
+    event.sender.send('transcript', {
+      text: item.text,
+      detectedLanguage: item.detectedLanguage,
+      latency: item.latency,
+    });
+
+    const configuredSourceLanguage = activeConfig?.sourceLanguage;
+    const targetLanguage = activeConfig?.targetLanguage;
+    if (!configuredSourceLanguage || !targetLanguage) {
+      continue;
+    }
+
+    const useDetected = env('USE_DETECTED_SOURCE_LANGUAGE', 'true').toLowerCase() === 'true';
+    const sourceLanguage = useDetected
+      ? toVachanaLanguageCode(item.detectedLanguage)
+      : configuredSourceLanguage;
+
+    let translatedText = '';
+    try {
+      translatedText = await translateText(item.text, sourceLanguage, targetLanguage);
+    } catch (error) {
+      const fallbackToSource = env('FALLBACK_TO_SOURCE_TEXT_ON_TRANSLATE_ERROR', 'true').toLowerCase() === 'true';
+      if (!fallbackToSource) {
+        throw error;
+      }
+      logError(`TRANSLATE ERROR -> using source text fallback: ${error.message}`);
+      translatedText = item.text;
+    }
+
+    if (!translatedText || !translatedText.trim()) {
+      writeEvent('segment_skipped_empty_translation', { segment_id: item.id });
+      continue;
+    }
+
+    const normalize = (s) => String(s || '').trim().toLowerCase();
+    if (normalize(translatedText) === normalize(item.text)
+        && normalize(sourceLanguage) !== normalize(targetLanguage)) {
+      logError(
+        `Translation output equals source (possible failure). `
+        + `source=${sourceLanguage}, target=${targetLanguage}, text="${item.text}"`
+      );
+    }
+
+    logInfo(`TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`);
+
+    if (sessionArtifacts) {
+      appendLine(
+        sessionArtifacts.translatedLogPath,
+        `[${nowISO()}] seg=${item.id} ${sourceLanguage}->${targetLanguage} :: ${translatedText}`
+      );
+    }
+
+    writeEvent('segment_translated', {
+      segment_id: item.id,
+      source_language: sourceLanguage,
+      target_language: targetLanguage,
+      source_text: item.text,
+      translated_text: translatedText,
+    });
+
+    event.sender.send('transcript', {
+      text: translatedText,
+      translated: true,
+      sourceText: item.text,
+    });
+
+    try {
+      const audioBuffer = await synthesizeTTS(translatedText);
       event.sender.send('translated-audio', {
         mimeType: 'audio/wav',
         audioBase64: audioBuffer.toString('base64'),
       });
-    })
-    .catch((error) => {
-      logError(`PIPELINE ERROR: ${error.message}`);
+      writeEvent('segment_tts', { segment_id: item.id, audio_bytes: audioBuffer.length });
+    } catch (error) {
+      logError(`PIPELINE ERROR (tts): ${error.message}`);
       sendStatus(event, translationRunning, `Pipeline error: ${error.message}`);
+    }
+  }
+
+  queueProcessing = false;
+}
+
+function enqueueTranscript(event, msg) {
+  if (!msg || msg.type !== 'transcript' || !msg.text || !msg.text.trim()) {
+    return;
+  }
+
+  if (!isMeaningfulTranscript(msg.text)) {
+    logInfo(`STT noise skipped: "${String(msg.text).trim()}"`);
+    writeEvent('segment_skipped_noise', {
+      raw_text: String(msg.text).trim(),
     });
+    return;
+  }
+
+  lastTranscriptAt = Date.now();
+
+  segmentCounter += 1;
+  transcriptQueue.push({
+    id: segmentCounter,
+    event,
+    text: msg.text.trim(),
+    detectedLanguage: msg.detected_language || activeConfig?.sourceLanguage || 'unknown',
+    latency: msg.latency ?? 'n/a',
+    receivedAt: nowISO(),
+  });
+
+  logInfo(`QUEUE pushed segment=${segmentCounter} pending=${transcriptQueue.length}`);
+  processTranscriptQueue().catch((err) => {
+    logError(`QUEUE ERROR: ${err.message}`);
+  });
 }
 
 function connectSTT(event, sourceLanguage) {
@@ -362,7 +714,6 @@ function connectSTT(event, sourceLanguage) {
 
     const includeLanguageHeader = env('VACHANA_STT_INCLUDE_LANGUAGE_HEADER', 'false').toLowerCase() === 'true';
     const headers = {
-      'X-API-Key-ID': apiKey,
       'x-api-key-id': apiKey,
     };
 
@@ -371,14 +722,9 @@ function connectSTT(event, sourceLanguage) {
     }
 
     logInfo(`Connecting STT websocket to ${endpoint}`);
+    sttSocket = new WebSocket(endpoint, { headers });
 
-    sttSocket = new WebSocket(endpoint, {
-      headers,
-    });
-
-    sttSocket.on('open', () => {
-      resolve();
-    });
+    sttSocket.on('open', () => resolve());
 
     sttSocket.on('message', (payload, isBinary) => {
       if (isBinary) {
@@ -400,7 +746,7 @@ function connectSTT(event, sourceLanguage) {
           return;
         }
 
-        handleTranscript(event, msg);
+        enqueueTranscript(event, msg);
       } catch (error) {
         sendStatus(event, translationRunning, `Bad STT message: ${error.message}`);
       }
@@ -409,7 +755,7 @@ function connectSTT(event, sourceLanguage) {
     sttSocket.on('error', (error) => {
       logError(`STT SOCKET ERROR: ${error.message}`);
       if (String(error.message).includes('403')) {
-        logError('STT auth rejected (403). Verify VACHANA_API_KEY_ID, endpoint path, and account access for realtime STT.');
+        logError('STT auth rejected (403). Verify key scope and realtime entitlement.');
       }
       reject(error);
     });
@@ -422,12 +768,98 @@ function connectSTT(event, sourceLanguage) {
   });
 }
 
+function startRestSttFallback(event, sourceLanguage) {
+  sttMode = 'rest';
+  restAudioBuffer = [];
+  restInFlight = false;
+
+  if (restFlushTimer) {
+    clearInterval(restFlushTimer);
+  }
+
+  const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', '48000'));
+  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', '2000'));
+
+  restFlushTimer = setInterval(async () => {
+    if (!translationRunning || sttMode !== 'rest' || restInFlight) {
+      return;
+    }
+
+    const totalBytes = restAudioBuffer.reduce((sum, b) => sum + b.length, 0);
+    if (totalBytes < minBytesPerFlush) {
+      return;
+    }
+
+    const chunk = Buffer.concat(restAudioBuffer);
+    restAudioBuffer = [];
+    restInFlight = true;
+
+    try {
+      sendStatus(event, true, 'REST STT processing segment...');
+      const text = await transcribeViaRest(chunk, sourceLanguage);
+      if (text && text.trim()) {
+        enqueueTranscript(event, {
+          type: 'transcript',
+          text,
+          detected_language: sourceLanguage,
+          latency: 'rest',
+        });
+      }
+    } catch (error) {
+      logError(`STT REST ERROR: ${error.message}`);
+      sendStatus(event, true, `STT REST error: ${error.message}`);
+    } finally {
+      restInFlight = false;
+    }
+  }, flushEveryMs);
+
+  logInfo('STT mode switched to REST fallback');
+  sendStatus(event, true, 'Realtime STT unavailable. Using REST STT fallback.');
+}
+
+function ensureSttHealthWatch() {
+  if (sttHealthTimer) {
+    clearInterval(sttHealthTimer);
+  }
+
+  sttHealthTimer = setInterval(() => {
+    if (!translationRunning || sttMode !== 'ws' || wsHealthFailoverTriggered) {
+      return;
+    }
+
+    const now = Date.now();
+    const recentSpeech = now - lastSpeechDetectedAt < 4000;
+    const transcriptStalled = now - lastTranscriptAt > 12000;
+    if (!recentSpeech || !transcriptStalled) {
+      return;
+    }
+
+    wsHealthFailoverTriggered = true;
+    logError('STT WS health check: speech detected but no transcripts for >12s. Switching to REST fallback.');
+
+    const sourceLanguage = activeConfig?.sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN');
+    if (activeSender) {
+      const evt = { sender: activeSender };
+      startRestSttFallback(evt, sourceLanguage);
+      sendStatus(evt, true, 'Auto-failover: switched STT from WebSocket to REST due to no transcript events.');
+    }
+  }, 3000);
+}
+
 function teardownPipeline() {
   translationRunning = false;
   activeConfig = null;
   sttMode = 'ws';
   restAudioBuffer = [];
   restInFlight = false;
+  transcriptQueue = [];
+  queueProcessing = false;
+  sessionArtifacts = null;
+  activeSender = null;
+  lastSpeechDetectedAt = 0;
+  lastTranscriptAt = 0;
+  wsHealthFailoverTriggered = false;
+
   if (restFlushTimer) {
     clearInterval(restFlushTimer);
     restFlushTimer = null;
@@ -435,6 +867,10 @@ function teardownPipeline() {
   if (metricsTimer) {
     clearInterval(metricsTimer);
     metricsTimer = null;
+  }
+  if (sttHealthTimer) {
+    clearInterval(sttHealthTimer);
+    sttHealthTimer = null;
   }
   if (sttSocket) {
     try {
@@ -451,63 +887,57 @@ function createWindow() {
     width: 420,
     height: 520,
     resizable: false,
-    title: "Gnani Translator",
+    title: 'Gnani Translator',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
-      contextIsolation: true
-    }
+      contextIsolation: true,
+    },
   });
 
   mainWindow.loadFile('index.html');
-  // mainWindow.webContents.openDevTools(); // Uncomment to see console
 }
 
 app.whenReady().then(createWindow);
 
 ipcMain.on('start-translation', (event, config = {}) => {
-  const sourceLanguage = config.sourceLanguage || 'en-IN';
-  const targetLanguage = config.targetLanguage || 'hi-IN';
-  activeConfig = {
-    sourceLanguage,
-    targetLanguage,
-  };
+  activeSender = event.sender;
+  const sourceLanguage = config.sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN');
+  const targetLanguage = config.targetLanguage || env('VACHANA_DEFAULT_TARGET_LANGUAGE', 'hi-IN');
+
+  initSessionArtifacts(sourceLanguage, targetLanguage);
+  writeEvent('session_start', { source_language: sourceLanguage, target_language: targetLanguage });
+
+  activeConfig = { sourceLanguage, targetLanguage };
+  audioFramesForwarded = 0;
+  audioFramesDropped = 0;
+  segmentCounter = 0;
+  lastTranscriptAt = Date.now();
+  lastSpeechDetectedAt = 0;
+  wsHealthFailoverTriggered = false;
+
+  if (metricsTimer) {
+    clearInterval(metricsTimer);
+  }
+  metricsTimer = setInterval(() => {
+    if (translationRunning) {
+      logInfo(`AUDIO frames forwarded=${audioFramesForwarded}, dropped=${audioFramesDropped}, queue=${transcriptQueue.length}`);
+    }
+  }, 5000);
 
   connectSTT(event, sourceLanguage)
     .then(() => {
       sttMode = 'ws';
       translationRunning = true;
-      audioFramesForwarded = 0;
-      audioFramesDropped = 0;
-      if (metricsTimer) {
-        clearInterval(metricsTimer);
-      }
-      metricsTimer = setInterval(() => {
-        if (translationRunning) {
-          logInfo(`AUDIO frames forwarded=${audioFramesForwarded}, dropped=${audioFramesDropped}`);
-        }
-      }, 5000);
-      sendStatus(
-        event,
-        true,
-        `Pipeline started (${sourceLanguage} -> ${targetLanguage}).`
-      );
+      ensureSttHealthWatch();
+      sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}).`);
     })
     .catch((error) => {
       const restFallback = env('ENABLE_STT_REST_FALLBACK', 'true').toLowerCase() === 'true';
       if (restFallback) {
         translationRunning = true;
-        audioFramesForwarded = 0;
-        audioFramesDropped = 0;
-        if (metricsTimer) {
-          clearInterval(metricsTimer);
-        }
-        metricsTimer = setInterval(() => {
-          if (translationRunning) {
-            logInfo(`AUDIO frames forwarded=${audioFramesForwarded}, dropped=${audioFramesDropped}`);
-          }
-        }, 5000);
         startRestSttFallback(event, sourceLanguage);
+        ensureSttHealthWatch();
         sendStatus(event, true, `WS STT failed (${error.message}). REST fallback active.`);
         return;
       }
@@ -519,11 +949,12 @@ ipcMain.on('start-translation', (event, config = {}) => {
 });
 
 ipcMain.on('stop-translation', (event) => {
+  writeEvent('session_stop', {});
   teardownPipeline();
   sendStatus(event, false, 'Translation stopped.');
 });
 
-ipcMain.on('audio-chunk', (event, chunkBytes) => {
+ipcMain.on('audio-chunk', (_event, chunkBytes) => {
   if (!translationRunning) {
     audioFramesDropped += 1;
     return;
@@ -534,10 +965,7 @@ ipcMain.on('audio-chunk', (event, chunkBytes) => {
     return;
   }
 
-  const buffer = Buffer.isBuffer(chunkBytes)
-    ? chunkBytes
-    : Buffer.from(chunkBytes);
-
+  const buffer = Buffer.isBuffer(chunkBytes) ? chunkBytes : Buffer.from(chunkBytes);
   if (buffer.length !== 1024) {
     audioFramesDropped += 1;
     return;
@@ -558,7 +986,29 @@ ipcMain.on('audio-chunk', (event, chunkBytes) => {
   audioFramesForwarded += 1;
 });
 
+ipcMain.on('mic-activity', (_event, payload = {}) => {
+  const now = Date.now();
+  if (now - lastMicActivityLogTs < 1000) {
+    return;
+  }
+  lastMicActivityLogTs = now;
+
+  const rms = Number(payload.rms || 0).toFixed(4);
+  const speaking = Boolean(payload.speaking);
+  if (speaking) {
+    lastSpeechDetectedAt = now;
+  }
+  const queuedFrames = Number(payload.queuedFrames || 0);
+  const sourceLang = payload.sourceLang || activeConfig?.sourceLanguage || 'n/a';
+  const targetLang = payload.targetLang || activeConfig?.targetLanguage || 'n/a';
+  logInfo(
+    `MIC activity speaking=${speaking} rms=${rms} queuedFrames=${queuedFrames} lang=${sourceLang}->${targetLang}`
+  );
+});
+
 app.on('window-all-closed', () => {
   teardownPipeline();
-  if (process.platform !== 'darwin') app.quit();
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
 });
