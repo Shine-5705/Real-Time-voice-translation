@@ -7,6 +7,7 @@ const sourceLangSelect = document.getElementById('sourceLang');
 const targetLangSelect = document.getElementById('targetLang');
 const transcriptBox = document.getElementById('transcriptBox');
 const passthroughToggle = document.getElementById('passthroughToggle');
+const guestSpeakerToggle = document.getElementById('guestSpeakerToggle');
 
 let inputStream = null;
 let monitorAudio = null;
@@ -430,15 +431,23 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
   startPacedSttSender();
   startTtsAggregateTimer();
 
+  const supported = (navigator.mediaDevices && navigator.mediaDevices.getSupportedConstraints)
+    ? navigator.mediaDevices.getSupportedConstraints()
+    : {};
+  const audioConstraints = {
+    deviceId: { exact: inputDeviceId },
+    echoCancellation: MIC_ECHO_CANCELLATION,
+    noiseSuppression: MIC_NOISE_SUPPRESSION,
+    autoGainControl: MIC_AUTO_GAIN_CONTROL,
+    channelCount: 1,
+    sampleRate: 16000,
+  };
+  if (supported.voiceIsolation) {
+    audioConstraints.voiceIsolation = true;
+  }
+
   inputStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      deviceId: { exact: inputDeviceId },
-      echoCancellation: MIC_ECHO_CANCELLATION,
-      noiseSuppression: MIC_NOISE_SUPPRESSION,
-      autoGainControl: MIC_AUTO_GAIN_CONTROL,
-      channelCount: 1,
-      sampleRate: 16000,
-    },
+    audio: audioConstraints,
     video: false,
   });
 
@@ -523,6 +532,7 @@ startBtn.addEventListener('click', () => {
       window.electronAPI.startTranslation({
         sourceLanguage: sourceLangSelect.value,
         targetLanguage: targetLangSelect.value,
+        speakerPreferenceMode: guestSpeakerToggle && guestSpeakerToggle.checked ? 'lock_first' : 'off',
       });
       startBtn.disabled = true;
       stopBtn.disabled = false;
@@ -606,10 +616,11 @@ window.electronAPI.onTranslationStatus((payload) => {
 });
 
 window.electronAPI.onTranscript((payload) => {
+  const spk = payload.speakerId ? ` [${payload.speakerId}]` : '';
   if (payload.translated) {
-    appendTranscriptLine(`Translated: ${payload.text}`);
+    appendTranscriptLine(`Translated${spk}: ${payload.text}`);
   } else {
-    appendTranscriptLine(`Source: ${payload.text}`);
+    appendTranscriptLine(`Source${spk}: ${payload.text}`);
   }
 });
 

@@ -37,6 +37,7 @@ let speechAggregationStartedAt = 0;
 let speechAggregationEvent = null;
 let recentSourceContext = [];
 let recentTargetContext = [];
+let lockedPreferredSpeakerId = null;
 
 function nowISO() {
   return new Date().toISOString();
@@ -253,12 +254,83 @@ function isLikelyIncompleteFragment(text) {
   return /\b(?:am|is|are|was|were|have|has|had|do|does|did|will|would|can|could|should|may|might|must)\s*$/i.test(value);
 }
 
+function extractSpeakerIdFromStt(msg) {
+  if (!msg || typeof msg !== 'object') {
+    return '';
+  }
+  const direct = msg.speaker_id ?? msg.speakerId ?? msg.speaker ?? msg.spk_id ?? msg.participant_id;
+  if (direct != null && String(direct).trim()) {
+    return String(direct).trim();
+  }
+  const nested = msg.result || msg.data;
+  if (nested && typeof nested === 'object') {
+    const n = nested.speaker_id ?? nested.speakerId ?? nested.speaker;
+    if (n != null && String(n).trim()) {
+      return String(n).trim();
+    }
+  }
+  return '';
+}
+
+function getSpeakerPreferenceMode() {
+  const fromConfig = activeConfig?.speakerPreferenceMode;
+  if (fromConfig && fromConfig !== 'inherit' && fromConfig !== '') {
+    return String(fromConfig).toLowerCase();
+  }
+  return String(env('SPEAKER_PREFERENCE_MODE', 'off')).toLowerCase();
+}
+
+function getExplicitPreferredSpeakerId() {
+  const v = activeConfig?.preferredSpeakerId ?? env('VACHANA_PREFERRED_SPEAKER_ID', '');
+  return String(v || '').trim();
+}
+
+function resetSpeakerPreferenceState() {
+  lockedPreferredSpeakerId = null;
+}
+
+function acceptSpeakerForPreference(speakerId) {
+  const mode = getSpeakerPreferenceMode();
+  if (!mode || mode === 'off' || mode === 'false' || mode === 'none') {
+    return true;
+  }
+
+  const sid = String(speakerId || '').trim();
+
+  if (mode === 'explicit') {
+    const want = getExplicitPreferredSpeakerId();
+    if (!want) {
+      return true;
+    }
+    if (!sid) {
+      return true;
+    }
+    return sid.toLowerCase() === want.toLowerCase();
+  }
+
+  if (mode === 'lock_first' || mode === 'guest') {
+    if (!sid) {
+      return true;
+    }
+    if (!lockedPreferredSpeakerId) {
+      lockedPreferredSpeakerId = sid;
+      logInfo(`SPEAKER preference (guest lock): primary="${lockedPreferredSpeakerId}"`);
+      return true;
+    }
+    return sid.toLowerCase() === lockedPreferredSpeakerId.toLowerCase();
+  }
+
+  return true;
+}
+
 function getSpeechAggregationConfig() {
+  // Rolling window (~1.5s): emit segments on silence, size cap, or max wait — similar in spirit to
+  // vachana-translations continuous ASR + periodic finalization (see translation_session.py).
   return {
-    idleMs: Number(env('SPEECH_AGGREGATION_IDLE_MS', '650')),
-    maxWaitMs: Number(env('SPEECH_AGGREGATION_MAX_WAIT_MS', '1800')),
-    minChars: Number(env('SPEECH_AGGREGATION_MIN_CHARS', '18')),
-    maxChars: Number(env('SPEECH_AGGREGATION_MAX_CHARS', '120')),
+    idleMs: Number(env('SPEECH_AGGREGATION_IDLE_MS', '1500')),
+    maxWaitMs: Number(env('SPEECH_AGGREGATION_MAX_WAIT_MS', '1500')),
+    minChars: Number(env('SPEECH_AGGREGATION_MIN_CHARS', '8')),
+    maxChars: Number(env('SPEECH_AGGREGATION_MAX_CHARS', '100')),
   };
 }
 
@@ -269,6 +341,21 @@ function clearSpeechAggregationTimer() {
   }
 }
 
+function rescheduleAggregationIfPending() {
+  if (speechAggregationBuffer.length === 0 || !speechAggregationStartedAt) {
+    return;
+  }
+  const { idleMs, maxWaitMs } = getSpeechAggregationConfig();
+  const ageMs = Date.now() - speechAggregationStartedAt;
+  const untilWindowEnd = maxWaitMs - ageMs;
+  if (untilWindowEnd <= 0) {
+    scheduleSpeechAggregationFlush(0);
+    return;
+  }
+  const delay = Math.min(idleMs, untilWindowEnd);
+  scheduleSpeechAggregationFlush(Math.max(80, delay));
+}
+
 function flushSpeechAggregationBuffer(force = false) {
   if (speechAggregationBuffer.length === 0) {
     clearSpeechAggregationTimer();
@@ -277,32 +364,46 @@ function flushSpeechAggregationBuffer(force = false) {
     return;
   }
 
-  const { minChars } = getSpeechAggregationConfig();
+  const { minChars, maxWaitMs } = getSpeechAggregationConfig();
+  const ageMs = speechAggregationStartedAt ? Date.now() - speechAggregationStartedAt : 0;
+  const windowExceeded = ageMs >= maxWaitMs;
+  const effectiveForce = force || windowExceeded;
+
   const combined = speechAggregationBuffer
     .map((item) => item.text)
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (!force) {
+  if (!effectiveForce) {
     if (combined.length < minChars && !isStrongTranscriptBoundary(combined)) {
+      rescheduleAggregationIfPending();
       return;
     }
 
     if (!isStrongTranscriptBoundary(combined) && isLikelyIncompleteFragment(combined)) {
+      rescheduleAggregationIfPending();
       return;
     }
 
     const tailFragment = speechAggregationBuffer[speechAggregationBuffer.length - 1]?.text || '';
     if (speechAggregationBuffer.length < 3 && isLikelyIncompleteFragment(tailFragment)) {
+      rescheduleAggregationIfPending();
       return;
     }
+  } else if (windowExceeded && combined && !isMeaningfulTranscript(combined)) {
+    speechAggregationBuffer = [];
+    clearSpeechAggregationTimer();
+    speechAggregationStartedAt = 0;
+    speechAggregationEvent = null;
+    return;
   }
 
   const event = speechAggregationEvent || speechAggregationBuffer[0].event;
   const detectedLanguage = speechAggregationBuffer[0].detectedLanguage || activeConfig?.sourceLanguage || 'unknown';
   const receivedAt = speechAggregationBuffer[0].receivedAt || nowISO();
   const aggregatedCount = speechAggregationBuffer.length;
+  const segmentSpeakerId = speechAggregationBuffer.map((x) => x.speakerId).find((s) => s && String(s).trim()) || '';
 
   speechAggregationBuffer = [];
   clearSpeechAggregationTimer();
@@ -319,6 +420,7 @@ function flushSpeechAggregationBuffer(force = false) {
     event,
     text: combined,
     detectedLanguage,
+    speakerId: segmentSpeakerId,
     latency: 'aggregated',
     receivedAt,
     aggregatedCount,
@@ -352,6 +454,7 @@ function enqueueSpeechFragment(event, msg) {
   speechAggregationBuffer.push({
     text: fragment,
     detectedLanguage: msg.detected_language || activeConfig?.sourceLanguage || 'unknown',
+    speakerId: extractSpeakerIdFromStt(msg),
     receivedAt: nowISO(),
     event,
   });
@@ -448,7 +551,7 @@ function buildWavFromPcm16(pcmBytes, sampleRate = 16000, channels = 1, bitsPerSa
   return buffer;
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 40000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -456,6 +559,13 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
       ...options,
       signal: controller.signal,
     });
+  } catch (err) {
+    const name = err && err.name;
+    const msg = String((err && err.message) || '');
+    if (name === 'AbortError' || /aborted/i.test(msg)) {
+      throw new Error(`HTTP request timed out after ${timeoutMs}ms (url=${String(url).slice(0, 120)})`);
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -506,13 +616,17 @@ async function transcribeViaRest(pcmBytes, sourceLanguage) {
       }
 
       const payload = await response.json();
+      const data = payload.data && typeof payload.data === 'object' ? payload.data : null;
       const transcript = String(
         payload.transcript || payload.text ||
-        (payload.data && (payload.data.transcript || payload.data.text)) ||
+        (data && (data.transcript || data.text)) ||
         ''
       ).trim();
+      const speakerId = String(
+        payload.speaker_id ?? payload.speaker ?? (data && (data.speaker_id || data.speaker)) ?? ''
+      ).trim();
       logInfo(`STT REST parsed endpoint=${url} transcript_len=${transcript.length} elapsed_ms=${elapsedMs(sttReqStartMs)}`);
-      return transcript;
+      return { transcript, speakerId };
     } catch (err) {
       lastError = err.message;
       logError(`STT REST exception endpoint=${url} error=${err.message}`);
@@ -630,7 +744,7 @@ async function synthesizeTTS(text) {
     env('VACHANA_TTS_ENDPOINT', '/api/v1/tts/inference'),
     ['/api/v1/tts/inference', '/api/v1/tts/rest', '/tts/rest', '/tts']
   );
-  const ttsTimeoutMs = Number(env('VACHANA_TTS_REST_TIMEOUT_MS', '12000'));
+  const ttsTimeoutMs = Number(env('VACHANA_TTS_REST_TIMEOUT_MS', '45000'));
 
   let lastError = 'unknown';
   for (const endpoint of endpoints) {
@@ -810,6 +924,7 @@ async function processTranscriptQueue() {
           text: item.text,
           detectedLanguage: item.detectedLanguage,
           latency: item.latency,
+          speakerId: item.speakerId || '',
         });
 
         const configuredSourceLanguage = activeConfig?.sourceLanguage;
@@ -886,6 +1001,7 @@ async function processTranscriptQueue() {
           text: translatedText,
           translated: true,
           sourceText: item.text,
+          speakerId: item.speakerId || '',
         });
 
         appendContextText(recentSourceContext, item.text);
@@ -1053,6 +1169,16 @@ function enqueueTranscript(event, msg) {
     return;
   }
 
+  const sttSpeakerId = extractSpeakerIdFromStt(msg);
+  if (!acceptSpeakerForPreference(sttSpeakerId)) {
+    logInfo(`STT skipped (speaker filter): speaker="${sttSpeakerId || 'unknown'}" text="${String(msg.text).trim().slice(0, 80)}"`);
+    writeEvent('segment_skipped_speaker', {
+      speaker_id: sttSpeakerId || '',
+      raw_text: String(msg.text).trim(),
+    });
+    return;
+  }
+
   const normalized = normalizeTranscriptForDedupe(msg.text);
   if (normalized && normalized === lastEnqueuedTranscriptNorm) {
     logInfo(`STT duplicate skipped: "${String(msg.text).trim()}"`);
@@ -1144,7 +1270,7 @@ function startRestSttFallback(event, sourceLanguage) {
   }
 
   const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', '32000'));
-  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', '1200'));
+  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', '1500'));
   const overlapMs = Number(env('VACHANA_STT_REST_OVERLAP_MS', '400'));
   const sampleRate = Number(env('VACHANA_STT_SAMPLE_RATE', '16000'));
   const overlapBytes = Math.max(0, Math.floor((overlapMs / 1000) * sampleRate * 2));
@@ -1173,13 +1299,14 @@ function startRestSttFallback(event, sourceLanguage) {
 
     try {
       sendStatus(event, true, 'REST STT processing segment...');
-      const text = await transcribeViaRest(chunk, sourceLanguage);
+      const { transcript: text, speakerId } = await transcribeViaRest(chunk, sourceLanguage);
       if (text && text.trim()) {
         enqueueTranscript(event, {
           type: 'transcript',
           text,
           detected_language: sourceLanguage,
           latency: 'rest',
+          speaker_id: speakerId || undefined,
         });
       }
     } catch (error) {
@@ -1240,6 +1367,7 @@ function teardownPipeline() {
   clearSpeechAggregationTimer();
   recentSourceContext = [];
   recentTargetContext = [];
+  resetSpeakerPreferenceState();
   sessionArtifacts = null;
   activeSender = null;
   lastSpeechDetectedAt = 0;
@@ -1272,7 +1400,7 @@ function teardownPipeline() {
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 420,
-    height: 520,
+    height: 560,
     resizable: false,
     title: 'Gnani Translator',
     webPreferences: {
@@ -1291,11 +1419,27 @@ ipcMain.on('start-translation', (event, config = {}) => {
   activeSender = event.sender;
   const sourceLanguage = config.sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN');
   const targetLanguage = config.targetLanguage || env('VACHANA_DEFAULT_TARGET_LANGUAGE', 'hi-IN');
+  const speakerPreferenceMode = config.speakerPreferenceMode != null && config.speakerPreferenceMode !== ''
+    ? String(config.speakerPreferenceMode).toLowerCase()
+    : String(env('SPEAKER_PREFERENCE_MODE', 'off')).toLowerCase();
+  const preferredSpeakerId = config.preferredSpeakerId != null
+    ? String(config.preferredSpeakerId).trim()
+    : String(env('VACHANA_PREFERRED_SPEAKER_ID', '')).trim();
 
   initSessionArtifacts(sourceLanguage, targetLanguage);
-  writeEvent('session_start', { source_language: sourceLanguage, target_language: targetLanguage });
+  writeEvent('session_start', {
+    source_language: sourceLanguage,
+    target_language: targetLanguage,
+    speaker_preference_mode: speakerPreferenceMode,
+  });
 
-  activeConfig = { sourceLanguage, targetLanguage };
+  resetSpeakerPreferenceState();
+  activeConfig = {
+    sourceLanguage,
+    targetLanguage,
+    speakerPreferenceMode,
+    preferredSpeakerId,
+  };
   audioFramesForwarded = 0;
   audioFramesDropped = 0;
   segmentCounter = 0;
