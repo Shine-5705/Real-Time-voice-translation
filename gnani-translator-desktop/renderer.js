@@ -14,6 +14,8 @@ let audioContext = null;
 let sourceNode = null;
 let processorNode = null;
 let silentGainNode = null;
+let highpassNode = null;
+let lowpassNode = null;
 let pcmBuffer = new Int16Array(0);
 let selectedOutputSinkId = '';
 const playbackQueue = [];
@@ -24,9 +26,16 @@ let lastMicTelemetryTs = 0;
 let inputDeviceById = new Map();
 let outputDeviceById = new Map();
 const TARGET_SAMPLE_RATE = 16000;
-const PREAMP_GAIN = 1.8;
-const TTS_CHUNK_AGGREGATE_MS = 180;
+const PREAMP_GAIN = 1.35;
+const TTS_CHUNK_AGGREGATE_MS = 150;
 const ENFORCE_TARGET_ONLY_AUDIO = true;
+const MIC_ECHO_CANCELLATION = true;
+const MIC_NOISE_SUPPRESSION = true;
+const MIC_AUTO_GAIN_CONTROL = true;
+const MIC_NOISE_GATE_THRESHOLD = 0.0095;
+const MIC_NOISE_GATE_SOFT_GAIN = 0.12;
+const MIC_HIGHPASS_HZ = 120;
+const MIC_LOWPASS_HZ = 3800;
 let ttsChunkBytesQueue = [];
 let ttsChunkMeta = { sampleRate: 16000, numChannels: 1, sampleWidth: 2 };
 let ttsAggregateTimer = null;
@@ -98,6 +107,23 @@ function applyGain(floatArray, gain) {
     out[i] = Math.max(-1, Math.min(1, v));
   }
   return out;
+}
+
+function applySoftNoiseGate(floatArray) {
+  const rms = computeRms(floatArray);
+  if (rms < MIC_NOISE_GATE_THRESHOLD * 0.5) {
+    return new Float32Array(floatArray.length);
+  }
+
+  if (rms < MIC_NOISE_GATE_THRESHOLD) {
+    const out = new Float32Array(floatArray.length);
+    for (let i = 0; i < floatArray.length; i++) {
+      out[i] = floatArray[i] * MIC_NOISE_GATE_SOFT_GAIN;
+    }
+    return out;
+  }
+
+  return floatArray;
 }
 
 function resampleTo16k(input, inputSampleRate) {
@@ -340,6 +366,16 @@ function teardownAudioGraph() {
     sourceNode = null;
   }
 
+  if (highpassNode) {
+    highpassNode.disconnect();
+    highpassNode = null;
+  }
+
+  if (lowpassNode) {
+    lowpassNode.disconnect();
+    lowpassNode = null;
+  }
+
   if (audioContext) {
     audioContext.close();
     audioContext = null;
@@ -397,9 +433,9 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
   inputStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       deviceId: { exact: inputDeviceId },
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
+      echoCancellation: MIC_ECHO_CANCELLATION,
+      noiseSuppression: MIC_NOISE_SUPPRESSION,
+      autoGainControl: MIC_AUTO_GAIN_CONTROL,
       channelCount: 1,
       sampleRate: 16000,
     },
@@ -408,6 +444,14 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
 
   audioContext = new AudioContext({ sampleRate: 16000 });
   sourceNode = audioContext.createMediaStreamSource(inputStream);
+  highpassNode = audioContext.createBiquadFilter();
+  highpassNode.type = 'highpass';
+  highpassNode.frequency.value = MIC_HIGHPASS_HZ;
+
+  lowpassNode = audioContext.createBiquadFilter();
+  lowpassNode.type = 'lowpass';
+  lowpassNode.frequency.value = MIC_LOWPASS_HZ;
+
   processorNode = audioContext.createScriptProcessor(1024, 1, 1);
   silentGainNode = audioContext.createGain();
   silentGainNode.gain.value = 0;
@@ -416,13 +460,16 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
     const inputRate = e.inputBuffer.sampleRate || audioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
-    const boosted = applyGain(resampled, PREAMP_GAIN);
+    const gated = applySoftNoiseGate(resampled);
+    const boosted = applyGain(gated, PREAMP_GAIN);
     emitMicTelemetry(boosted);
     sendPCMToSTT(toInt16(boosted));
   };
 
   // Keep callback running while preventing local speaker feedback.
-  sourceNode.connect(processorNode);
+  sourceNode.connect(highpassNode);
+  highpassNode.connect(lowpassNode);
+  lowpassNode.connect(processorNode);
   processorNode.connect(silentGainNode);
   silentGainNode.connect(audioContext.destination);
 

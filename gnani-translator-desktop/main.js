@@ -31,6 +31,12 @@ let restOverlapBuffer = Buffer.alloc(0);
 let lastEnqueuedTranscriptNorm = '';
 let ttsJobQueue = [];
 let ttsWorkerActive = false;
+let speechAggregationBuffer = [];
+let speechAggregationTimer = null;
+let speechAggregationStartedAt = 0;
+let speechAggregationEvent = null;
+let recentSourceContext = [];
+let recentTargetContext = [];
 
 function nowISO() {
   return new Date().toISOString();
@@ -46,6 +52,10 @@ function logError(message) {
 
 function env(name, fallback = '') {
   return process.env[name] || fallback;
+}
+
+function elapsedMs(startMs) {
+  return Math.max(0, Date.now() - Number(startMs || Date.now()));
 }
 
 function getWorkspaceRoot() {
@@ -168,6 +178,37 @@ function parseTranslationText(payload) {
   );
 }
 
+function appendContextText(buffer, text) {
+  const value = String(text || '').trim();
+  if (!value) {
+    return;
+  }
+
+  const maxSegments = Number(env('CONTEXT_WINDOW_SEGMENTS', '4'));
+  const maxChars = Number(env('CONTEXT_WINDOW_MAX_CHARS', '260'));
+
+  buffer.push(value);
+  while (buffer.length > maxSegments) {
+    buffer.shift();
+  }
+
+  while (buffer.join(' ').length > maxChars && buffer.length > 1) {
+    buffer.shift();
+  }
+}
+
+function getContextHint() {
+  const enabled = env('ENABLE_CONTEXTUAL_TRANSLATION', 'true').toLowerCase() === 'true';
+  if (!enabled) {
+    return { source: '', target: '' };
+  }
+
+  return {
+    source: recentSourceContext.join(' '),
+    target: recentTargetContext.join(' '),
+  };
+}
+
 function isMeaningfulTranscript(text) {
   const value = String(text || '').trim();
   if (!value) {
@@ -177,6 +218,161 @@ function isMeaningfulTranscript(text) {
   // Accept only segments that contain at least one letter or number.
   // This avoids translating pure punctuation/noise like "." or "।".
   return /[\p{L}\p{N}]/u.test(value);
+}
+
+function isStrongTranscriptBoundary(text) {
+  return /[.!?…।]$/.test(String(text || '').trim());
+}
+
+function isLikelyIncompleteFragment(text) {
+  const value = String(text || '').trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+
+  if (value.length <= 3) {
+    return true;
+  }
+
+  if (/[-,:;]$/.test(value)) {
+    return true;
+  }
+
+  const trailingTokens = new Set([
+    'and', 'or', 'but', 'so', 'because', 'if', 'when', 'while', 'where', 'which',
+    'that', 'than', 'to', 'of', 'for', 'in', 'on', 'at', 'with', 'from', 'by',
+    'as', 'about', 'into', 'over', 'after', 'before', 'around', 'related',
+  ]);
+
+  const tokens = value.split(/\s+/).filter(Boolean);
+  const lastToken = tokens[tokens.length - 1] || '';
+  if (trailingTokens.has(lastToken)) {
+    return true;
+  }
+
+  return /\b(?:am|is|are|was|were|have|has|had|do|does|did|will|would|can|could|should|may|might|must)\s*$/i.test(value);
+}
+
+function getSpeechAggregationConfig() {
+  return {
+    idleMs: Number(env('SPEECH_AGGREGATION_IDLE_MS', '650')),
+    maxWaitMs: Number(env('SPEECH_AGGREGATION_MAX_WAIT_MS', '1800')),
+    minChars: Number(env('SPEECH_AGGREGATION_MIN_CHARS', '18')),
+    maxChars: Number(env('SPEECH_AGGREGATION_MAX_CHARS', '120')),
+  };
+}
+
+function clearSpeechAggregationTimer() {
+  if (speechAggregationTimer) {
+    clearTimeout(speechAggregationTimer);
+    speechAggregationTimer = null;
+  }
+}
+
+function flushSpeechAggregationBuffer(force = false) {
+  if (speechAggregationBuffer.length === 0) {
+    clearSpeechAggregationTimer();
+    speechAggregationStartedAt = 0;
+    speechAggregationEvent = null;
+    return;
+  }
+
+  const { minChars } = getSpeechAggregationConfig();
+  const combined = speechAggregationBuffer
+    .map((item) => item.text)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!force) {
+    if (combined.length < minChars && !isStrongTranscriptBoundary(combined)) {
+      return;
+    }
+
+    if (!isStrongTranscriptBoundary(combined) && isLikelyIncompleteFragment(combined)) {
+      return;
+    }
+
+    const tailFragment = speechAggregationBuffer[speechAggregationBuffer.length - 1]?.text || '';
+    if (speechAggregationBuffer.length < 3 && isLikelyIncompleteFragment(tailFragment)) {
+      return;
+    }
+  }
+
+  const event = speechAggregationEvent || speechAggregationBuffer[0].event;
+  const detectedLanguage = speechAggregationBuffer[0].detectedLanguage || activeConfig?.sourceLanguage || 'unknown';
+  const receivedAt = speechAggregationBuffer[0].receivedAt || nowISO();
+  const aggregatedCount = speechAggregationBuffer.length;
+
+  speechAggregationBuffer = [];
+  clearSpeechAggregationTimer();
+  speechAggregationStartedAt = 0;
+  speechAggregationEvent = null;
+
+  if (!combined) {
+    return;
+  }
+
+  segmentCounter += 1;
+  transcriptQueue.push({
+    id: segmentCounter,
+    event,
+    text: combined,
+    detectedLanguage,
+    latency: 'aggregated',
+    receivedAt,
+    aggregatedCount,
+    createdAtMs: Date.now(),
+  });
+
+  logInfo(`QUEUE pushed aggregated segment=${segmentCounter} fragments=${aggregatedCount} pending=${transcriptQueue.length}`);
+  processTranscriptQueue().catch((err) => {
+    logError(`QUEUE ERROR: ${err.message}`);
+  });
+}
+
+function scheduleSpeechAggregationFlush(delayMs) {
+  clearSpeechAggregationTimer();
+  speechAggregationTimer = setTimeout(() => {
+    flushSpeechAggregationBuffer(false);
+  }, delayMs);
+}
+
+function enqueueSpeechFragment(event, msg) {
+  const fragment = String(msg.text || '').trim();
+  if (!fragment) {
+    return;
+  }
+
+  if (!speechAggregationStartedAt) {
+    speechAggregationStartedAt = Date.now();
+  }
+
+  speechAggregationEvent = event;
+  speechAggregationBuffer.push({
+    text: fragment,
+    detectedLanguage: msg.detected_language || activeConfig?.sourceLanguage || 'unknown',
+    receivedAt: nowISO(),
+    event,
+  });
+
+  const { idleMs, maxWaitMs, maxChars } = getSpeechAggregationConfig();
+  const combined = speechAggregationBuffer
+    .map((item) => item.text)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const ageMs = Date.now() - speechAggregationStartedAt;
+  const shouldFlushSoon = isStrongTranscriptBoundary(fragment) || combined.length >= maxChars || ageMs >= maxWaitMs;
+  const keepWaitingForContext = isLikelyIncompleteFragment(fragment) && ageMs < maxWaitMs;
+
+  if (shouldFlushSoon && !keepWaitingForContext) {
+    scheduleSpeechAggregationFlush(120);
+  } else if (ageMs >= maxWaitMs) {
+    scheduleSpeechAggregationFlush(120);
+  } else {
+    scheduleSpeechAggregationFlush(idleMs);
+  }
 }
 
 function normalizeTranscriptForDedupe(text) {
@@ -286,6 +482,7 @@ async function transcribeViaRest(pcmBytes, sourceLanguage) {
     form.append('preferred_language', language);
 
     try {
+      const sttReqStartMs = Date.now();
       logInfo(`STT REST request endpoint=${url}`);
       const response = await fetchWithTimeout(url, {
         method: 'POST',
@@ -296,7 +493,7 @@ async function transcribeViaRest(pcmBytes, sourceLanguage) {
       }, sttTimeoutMs);
 
       if (response.status === 404) {
-        logError(`STT REST endpoint not found: ${url}`);
+        logError(`STT REST endpoint not found: ${url} elapsed_ms=${elapsedMs(sttReqStartMs)}`);
         lastError = `404 at ${url}`;
         continue;
       }
@@ -304,7 +501,7 @@ async function transcribeViaRest(pcmBytes, sourceLanguage) {
       if (!response.ok) {
         const body = await response.text();
         lastError = `status=${response.status} endpoint=${url} body=${body.slice(0, 300)}`;
-        logError(`STT REST error ${lastError}`);
+        logError(`STT REST error ${lastError} elapsed_ms=${elapsedMs(sttReqStartMs)}`);
         continue;
       }
 
@@ -314,7 +511,7 @@ async function transcribeViaRest(pcmBytes, sourceLanguage) {
         (payload.data && (payload.data.transcript || payload.data.text)) ||
         ''
       ).trim();
-      logInfo(`STT REST parsed endpoint=${url} transcript_len=${transcript.length}`);
+      logInfo(`STT REST parsed endpoint=${url} transcript_len=${transcript.length} elapsed_ms=${elapsedMs(sttReqStartMs)}`);
       return transcript;
     } catch (err) {
       lastError = err.message;
@@ -347,7 +544,7 @@ async function translateViaPublicFallback(text, sourceLanguage, targetLanguage) 
     .trim();
 }
 
-async function translateText(text, sourceLanguage, targetLanguage) {
+async function translateText(text, sourceLanguage, targetLanguage, contextHint = { source: '', target: '' }) {
   if (!text || !text.trim()) {
     return '';
   }
@@ -364,6 +561,7 @@ async function translateText(text, sourceLanguage, targetLanguage) {
   for (const endpoint of endpoints) {
     const url = buildUrl(endpoint);
     try {
+      const translateReqStartMs = Date.now();
       logInfo(`Translate request endpoint=${url}`);
       const response = await fetchWithTimeout(url, {
         method: 'POST',
@@ -377,26 +575,29 @@ async function translateText(text, sourceLanguage, targetLanguage) {
           target_language: targetLanguage,
           source: sourceLanguage,
           target: targetLanguage,
+          context_before_source: contextHint.source || '',
+          context_before_target: contextHint.target || '',
+          context_window_segments: Number(env('CONTEXT_WINDOW_SEGMENTS', '4')),
         }),
       }, translateTimeoutMs);
 
       if (response.status === 404) {
         lastError = `404 at ${url}`;
-        logError(`Translate endpoint not found: ${url}`);
+        logError(`Translate endpoint not found: ${url} elapsed_ms=${elapsedMs(translateReqStartMs)}`);
         continue;
       }
 
       if (!response.ok) {
         const body = await response.text();
         lastError = `status=${response.status} endpoint=${url} body=${body.slice(0, 300)}`;
-        logError(`Translate API error ${lastError}`);
+        logError(`Translate API error ${lastError} elapsed_ms=${elapsedMs(translateReqStartMs)}`);
         continue;
       }
 
       const payload = await response.json();
       const translated = parseTranslationText(payload);
       if (translated) {
-        logInfo(`Translate parsed endpoint=${url} translated_len=${translated.length}`);
+        logInfo(`Translate parsed endpoint=${url} translated_len=${translated.length} elapsed_ms=${elapsedMs(translateReqStartMs)}`);
         return translated;
       }
 
@@ -435,6 +636,7 @@ async function synthesizeTTS(text) {
   for (const endpoint of endpoints) {
     const url = buildUrl(endpoint);
     try {
+      const ttsReqStartMs = Date.now();
       logInfo(`TTS request endpoint=${url}`);
       const response = await fetchWithTimeout(url, {
         method: 'POST',
@@ -458,20 +660,20 @@ async function synthesizeTTS(text) {
 
       if (response.status === 404) {
         lastError = `404 at ${url}`;
-        logError(`TTS endpoint not found: ${url}`);
+        logError(`TTS endpoint not found: ${url} elapsed_ms=${elapsedMs(ttsReqStartMs)}`);
         continue;
       }
 
       if (!response.ok) {
         const body = await response.text();
         lastError = `status=${response.status} endpoint=${url} body=${body.slice(0, 300)}`;
-        logError(`TTS API error ${lastError}`);
+        logError(`TTS API error ${lastError} elapsed_ms=${elapsedMs(ttsReqStartMs)}`);
         continue;
       }
 
       const arr = await response.arrayBuffer();
       const out = Buffer.from(arr);
-      logInfo(`TTS parsed endpoint=${url} bytes=${out.length}`);
+      logInfo(`TTS parsed endpoint=${url} bytes=${out.length} elapsed_ms=${elapsedMs(ttsReqStartMs)}`);
       return out;
     } catch (error) {
       lastError = `${error.message}`;
@@ -587,6 +789,7 @@ async function processTranscriptQueue() {
     while (transcriptQueue.length > 0) {
       const item = transcriptQueue.shift();
       const event = item.event;
+      const segmentStartMs = Number(item.createdAtMs || Date.now());
 
       try {
         logInfo(`STT(${item.detectedLanguage}, latency=${item.latency}ms): ${item.text}`);
@@ -619,10 +822,14 @@ async function processTranscriptQueue() {
         const sourceLanguage = useDetected
           ? toVachanaLanguageCode(item.detectedLanguage)
           : configuredSourceLanguage;
+        const contextHint = getContextHint();
 
         let translatedText = '';
+        const translateStartMs = Date.now();
+        let translateElapsedMs = 0;
         try {
-          translatedText = await translateText(item.text, sourceLanguage, targetLanguage);
+          translatedText = await translateText(item.text, sourceLanguage, targetLanguage, contextHint);
+          translateElapsedMs = elapsedMs(translateStartMs);
         } catch (error) {
           const fallbackToSource = env('FALLBACK_TO_SOURCE_TEXT_ON_TRANSLATE_ERROR', 'true').toLowerCase() === 'true';
           if (!fallbackToSource) {
@@ -630,6 +837,7 @@ async function processTranscriptQueue() {
           }
           logError(`TRANSLATE ERROR -> using source text fallback: ${error.message}`);
           translatedText = item.text;
+          translateElapsedMs = elapsedMs(translateStartMs);
         }
 
         if (!translatedText || !translatedText.trim()) {
@@ -680,10 +888,15 @@ async function processTranscriptQueue() {
           sourceText: item.text,
         });
 
+        appendContextText(recentSourceContext, item.text);
+        appendContextText(recentTargetContext, translatedText);
+
         enqueueTtsJob({
           segmentId: item.id,
           translatedText,
           event,
+          segmentStartMs,
+          translateElapsedMs,
         });
       } catch (error) {
         logError(`SEGMENT ERROR seg=${item.id}: ${error.message}`);
@@ -721,10 +934,18 @@ async function processTtsJobQueue() {
   ttsWorkerActive = true;
   while (ttsJobQueue.length > 0) {
     const job = ttsJobQueue.shift();
-    const { segmentId, translatedText, event } = job;
+    const {
+      segmentId,
+      translatedText,
+      event,
+      segmentStartMs,
+      translateElapsedMs,
+    } = job;
+    const ttsQueueWaitMs = elapsedMs(segmentStartMs) - Number(translateElapsedMs || 0);
 
     try {
       const ttsRealtimeEnabled = env('ENABLE_TTS_REALTIME_WS', 'true').toLowerCase() === 'true';
+      const ttsStartMs = Date.now();
       if (ttsRealtimeEnabled) {
         const ttsRealtimeEndpoint = env('VACHANA_TTS_REALTIME_ENDPOINT', 'wss://api.vachana.ai/api/v1/tts');
         const sampleRate = Number(env('VACHANA_TTS_SAMPLE_RATE', '16000'));
@@ -764,6 +985,11 @@ async function processTtsJobQueue() {
             chunk_count: stats.chunkCount,
             mode: 'realtime-ws',
           });
+          logInfo(
+            `LATENCY seg=${segmentId} total_ms=${elapsedMs(segmentStartMs)} `
+            + `translate_ms=${Number(translateElapsedMs || 0)} tts_queue_wait_ms=${Math.max(0, ttsQueueWaitMs)} `
+            + `tts_ms=${elapsedMs(ttsStartMs)} mode=realtime-ws`
+          );
         } catch (wsError) {
           const restFallbackEnabled = env('ENABLE_TTS_REST_FALLBACK_ON_WS_ERROR', 'true').toLowerCase() === 'true';
           if (!restFallbackEnabled) {
@@ -782,6 +1008,11 @@ async function processTtsJobQueue() {
             mode: 'rest-fallback',
             realtime_error: wsError.message,
           });
+          logInfo(
+            `LATENCY seg=${segmentId} total_ms=${elapsedMs(segmentStartMs)} `
+            + `translate_ms=${Number(translateElapsedMs || 0)} tts_queue_wait_ms=${Math.max(0, ttsQueueWaitMs)} `
+            + `tts_ms=${elapsedMs(ttsStartMs)} mode=rest-fallback`
+          );
         }
       } else {
         const audioBuffer = await synthesizeTTS(translatedText);
@@ -794,6 +1025,11 @@ async function processTtsJobQueue() {
           audio_bytes: audioBuffer.length,
           mode: 'rest',
         });
+        logInfo(
+          `LATENCY seg=${segmentId} total_ms=${elapsedMs(segmentStartMs)} `
+          + `translate_ms=${Number(translateElapsedMs || 0)} tts_queue_wait_ms=${Math.max(0, ttsQueueWaitMs)} `
+          + `tts_ms=${elapsedMs(ttsStartMs)} mode=rest`
+        );
       }
     } catch (error) {
       logError(`PIPELINE ERROR (tts): ${error.message}`);
@@ -829,20 +1065,7 @@ function enqueueTranscript(event, msg) {
 
   lastTranscriptAt = Date.now();
 
-  segmentCounter += 1;
-  transcriptQueue.push({
-    id: segmentCounter,
-    event,
-    text: msg.text.trim(),
-    detectedLanguage: msg.detected_language || activeConfig?.sourceLanguage || 'unknown',
-    latency: msg.latency ?? 'n/a',
-    receivedAt: nowISO(),
-  });
-
-  logInfo(`QUEUE pushed segment=${segmentCounter} pending=${transcriptQueue.length}`);
-  processTranscriptQueue().catch((err) => {
-    logError(`QUEUE ERROR: ${err.message}`);
-  });
+  enqueueSpeechFragment(event, msg);
 }
 
 function connectSTT(event, sourceLanguage) {
@@ -1011,6 +1234,12 @@ function teardownPipeline() {
   queueProcessing = false;
   ttsJobQueue = [];
   ttsWorkerActive = false;
+  speechAggregationBuffer = [];
+  speechAggregationEvent = null;
+  speechAggregationStartedAt = 0;
+  clearSpeechAggregationTimer();
+  recentSourceContext = [];
+  recentTargetContext = [];
   sessionArtifacts = null;
   activeSender = null;
   lastSpeechDetectedAt = 0;
@@ -1074,6 +1303,8 @@ ipcMain.on('start-translation', (event, config = {}) => {
   lastTranscriptAt = Date.now();
   lastSpeechDetectedAt = 0;
   wsHealthFailoverTriggered = false;
+  recentSourceContext = [];
+  recentTargetContext = [];
 
   if (metricsTimer) {
     clearInterval(metricsTimer);
