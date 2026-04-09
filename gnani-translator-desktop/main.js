@@ -252,6 +252,19 @@ function buildWavFromPcm16(pcmBytes, sampleRate = 16000, channels = 1, bitsPerSa
   return buffer;
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function transcribeViaRest(pcmBytes, sourceLanguage) {
   const apiKey = env('VACHANA_API_KEY_ID');
   const endpoints = candidateEndpoints(
@@ -262,6 +275,7 @@ async function transcribeViaRest(pcmBytes, sourceLanguage) {
 
   const wav = buildWavFromPcm16(pcmBytes, Number(env('VACHANA_STT_SAMPLE_RATE', '16000')));
   const language = sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN');
+  const sttTimeoutMs = Number(env('VACHANA_STT_REST_TIMEOUT_MS', '12000'));
 
   let lastError = 'unknown error';
   for (const endpoint of endpoints) {
@@ -273,13 +287,13 @@ async function transcribeViaRest(pcmBytes, sourceLanguage) {
 
     try {
       logInfo(`STT REST request endpoint=${url}`);
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
           'X-API-Key-ID': apiKey,
         },
         body: form,
-      });
+      }, sttTimeoutMs);
 
       if (response.status === 404) {
         logError(`STT REST endpoint not found: ${url}`);
@@ -344,13 +358,14 @@ async function translateText(text, sourceLanguage, targetLanguage) {
     env('VACHANA_TRANSLATE_ENDPOINT', '/api/v1/tts/translate'),
     ['/api/v1/translate', '/translate', '/api/v1/translation', '/api/v1/tts/translate']
   );
+  const translateTimeoutMs = Number(env('VACHANA_TRANSLATE_TIMEOUT_MS', '10000'));
 
   let lastError = 'unknown';
   for (const endpoint of endpoints) {
     const url = buildUrl(endpoint);
     try {
       logInfo(`Translate request endpoint=${url}`);
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -363,7 +378,7 @@ async function translateText(text, sourceLanguage, targetLanguage) {
           source: sourceLanguage,
           target: targetLanguage,
         }),
-      });
+      }, translateTimeoutMs);
 
       if (response.status === 404) {
         lastError = `404 at ${url}`;
@@ -414,13 +429,14 @@ async function synthesizeTTS(text) {
     env('VACHANA_TTS_ENDPOINT', '/api/v1/tts/inference'),
     ['/api/v1/tts/inference', '/api/v1/tts/rest', '/tts/rest', '/tts']
   );
+  const ttsTimeoutMs = Number(env('VACHANA_TTS_REST_TIMEOUT_MS', '12000'));
 
   let lastError = 'unknown';
   for (const endpoint of endpoints) {
     const url = buildUrl(endpoint);
     try {
       logInfo(`TTS request endpoint=${url}`);
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -438,7 +454,7 @@ async function synthesizeTTS(text) {
             sample_width: 2,
           },
         }),
-      });
+      }, ttsTimeoutMs);
 
       if (response.status === 404) {
         lastError = `404 at ${url}`;
@@ -567,109 +583,127 @@ async function processTranscriptQueue() {
   }
   queueProcessing = true;
 
-  while (transcriptQueue.length > 0) {
-    const item = transcriptQueue.shift();
-    const event = item.event;
+  try {
+    while (transcriptQueue.length > 0) {
+      const item = transcriptQueue.shift();
+      const event = item.event;
 
-    logInfo(`STT(${item.detectedLanguage}, latency=${item.latency}ms): ${item.text}`);
+      try {
+        logInfo(`STT(${item.detectedLanguage}, latency=${item.latency}ms): ${item.text}`);
 
-    if (sessionArtifacts) {
-      appendLine(sessionArtifacts.sourceLogPath, `[${item.receivedAt}] seg=${item.id} ${item.detectedLanguage} :: ${item.text}`);
-      appendLine(sessionArtifacts.spokenTextPath, item.text);
-    }
+        if (sessionArtifacts) {
+          appendLine(sessionArtifacts.sourceLogPath, `[${item.receivedAt}] seg=${item.id} ${item.detectedLanguage} :: ${item.text}`);
+          appendLine(sessionArtifacts.spokenTextPath, item.text);
+        }
 
-    writeEvent('segment_received', {
-      segment_id: item.id,
-      source_text: item.text,
-      detected_language: item.detectedLanguage,
-      latency: item.latency,
-    });
+        writeEvent('segment_received', {
+          segment_id: item.id,
+          source_text: item.text,
+          detected_language: item.detectedLanguage,
+          latency: item.latency,
+        });
 
-    event.sender.send('transcript', {
-      text: item.text,
-      detectedLanguage: item.detectedLanguage,
-      latency: item.latency,
-    });
+        event.sender.send('transcript', {
+          text: item.text,
+          detectedLanguage: item.detectedLanguage,
+          latency: item.latency,
+        });
 
-    const configuredSourceLanguage = activeConfig?.sourceLanguage;
-    const targetLanguage = activeConfig?.targetLanguage;
-    if (!configuredSourceLanguage || !targetLanguage) {
-      continue;
-    }
+        const configuredSourceLanguage = activeConfig?.sourceLanguage;
+        const targetLanguage = activeConfig?.targetLanguage;
+        if (!configuredSourceLanguage || !targetLanguage) {
+          continue;
+        }
 
-    const useDetected = env('USE_DETECTED_SOURCE_LANGUAGE', 'true').toLowerCase() === 'true';
-    const sourceLanguage = useDetected
-      ? toVachanaLanguageCode(item.detectedLanguage)
-      : configuredSourceLanguage;
+        const useDetected = env('USE_DETECTED_SOURCE_LANGUAGE', 'true').toLowerCase() === 'true';
+        const sourceLanguage = useDetected
+          ? toVachanaLanguageCode(item.detectedLanguage)
+          : configuredSourceLanguage;
 
-    let translatedText = '';
-    try {
-      translatedText = await translateText(item.text, sourceLanguage, targetLanguage);
-    } catch (error) {
-      const fallbackToSource = env('FALLBACK_TO_SOURCE_TEXT_ON_TRANSLATE_ERROR', 'true').toLowerCase() === 'true';
-      if (!fallbackToSource) {
-        throw error;
-      }
-      logError(`TRANSLATE ERROR -> using source text fallback: ${error.message}`);
-      translatedText = item.text;
-    }
+        let translatedText = '';
+        try {
+          translatedText = await translateText(item.text, sourceLanguage, targetLanguage);
+        } catch (error) {
+          const fallbackToSource = env('FALLBACK_TO_SOURCE_TEXT_ON_TRANSLATE_ERROR', 'true').toLowerCase() === 'true';
+          if (!fallbackToSource) {
+            throw error;
+          }
+          logError(`TRANSLATE ERROR -> using source text fallback: ${error.message}`);
+          translatedText = item.text;
+        }
 
-    if (!translatedText || !translatedText.trim()) {
-      writeEvent('segment_skipped_empty_translation', { segment_id: item.id });
-      continue;
-    }
+        if (!translatedText || !translatedText.trim()) {
+          writeEvent('segment_skipped_empty_translation', { segment_id: item.id });
+          continue;
+        }
 
-    const normalize = (s) => String(s || '').trim().toLowerCase();
-    const strictTargetOnly = env('STRICT_TARGET_ONLY_OUTPUT', 'true').toLowerCase() === 'true';
-    if (normalize(translatedText) === normalize(item.text)
-        && normalize(sourceLanguage) !== normalize(targetLanguage)) {
-      logError(
-        `Translation output equals source (possible failure). `
-        + `source=${sourceLanguage}, target=${targetLanguage}, text="${item.text}"`
-      );
+        const normalize = (s) => String(s || '').trim().toLowerCase();
+        const strictTargetOnly = env('STRICT_TARGET_ONLY_OUTPUT', 'true').toLowerCase() === 'true';
+        if (normalize(translatedText) === normalize(item.text)
+            && normalize(sourceLanguage) !== normalize(targetLanguage)) {
+          logError(
+            `Translation output equals source (possible failure). `
+            + `source=${sourceLanguage}, target=${targetLanguage}, text="${item.text}"`
+          );
 
-      if (strictTargetOnly) {
-        writeEvent('segment_skipped_source_like_output', {
+          if (strictTargetOnly) {
+            writeEvent('segment_skipped_source_like_output', {
+              segment_id: item.id,
+              source_language: sourceLanguage,
+              target_language: targetLanguage,
+              text: item.text,
+            });
+            continue;
+          }
+        }
+
+        logInfo(`TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`);
+
+        if (sessionArtifacts) {
+          appendLine(
+            sessionArtifacts.translatedLogPath,
+            `[${nowISO()}] seg=${item.id} ${sourceLanguage}->${targetLanguage} :: ${translatedText}`
+          );
+        }
+
+        writeEvent('segment_translated', {
           segment_id: item.id,
           source_language: sourceLanguage,
           target_language: targetLanguage,
-          text: item.text,
+          source_text: item.text,
+          translated_text: translatedText,
         });
-        continue;
+
+        event.sender.send('transcript', {
+          text: translatedText,
+          translated: true,
+          sourceText: item.text,
+        });
+
+        enqueueTtsJob({
+          segmentId: item.id,
+          translatedText,
+          event,
+        });
+      } catch (error) {
+        logError(`SEGMENT ERROR seg=${item.id}: ${error.message}`);
+        writeEvent('segment_error', {
+          segment_id: item.id,
+          error: error.message,
+          source_text: item.text,
+        });
       }
     }
+  } finally {
+    queueProcessing = false;
 
-    logInfo(`TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`);
-
-    if (sessionArtifacts) {
-      appendLine(
-        sessionArtifacts.translatedLogPath,
-        `[${nowISO()}] seg=${item.id} ${sourceLanguage}->${targetLanguage} :: ${translatedText}`
-      );
+    // If new segments arrived while finalizing, restart processing.
+    if (transcriptQueue.length > 0) {
+      processTranscriptQueue().catch((err) => {
+        logError(`QUEUE ERROR: ${err.message}`);
+      });
     }
-
-    writeEvent('segment_translated', {
-      segment_id: item.id,
-      source_language: sourceLanguage,
-      target_language: targetLanguage,
-      source_text: item.text,
-      translated_text: translatedText,
-    });
-
-    event.sender.send('transcript', {
-      text: translatedText,
-      translated: true,
-      sourceText: item.text,
-    });
-
-    enqueueTtsJob({
-      segmentId: item.id,
-      translatedText,
-      event,
-    });
   }
-
-  queueProcessing = false;
 }
 
 function enqueueTtsJob(job) {

@@ -22,9 +22,11 @@ let sttFrameQueue = [];
 let sttSendTimer = null;
 let lastMicTelemetryTs = 0;
 let inputDeviceById = new Map();
+let outputDeviceById = new Map();
 const TARGET_SAMPLE_RATE = 16000;
 const PREAMP_GAIN = 1.8;
 const TTS_CHUNK_AGGREGATE_MS = 180;
+const ENFORCE_TARGET_ONLY_AUDIO = true;
 let ttsChunkBytesQueue = [];
 let ttsChunkMeta = { sampleRate: 16000, numChannels: 1, sampleWidth: 2 };
 let ttsAggregateTimer = null;
@@ -261,6 +263,9 @@ async function playNextAudioInQueue() {
       audioEl.onended = resolve;
       audioEl.onerror = resolve;
     });
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = 'Status: Failed to route translated audio. Re-select CABLE Input as output and restart.';
   } finally {
     URL.revokeObjectURL(item.url);
     playbackActive = false;
@@ -423,7 +428,7 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
 
   // Do not pass raw mic to VB-CABLE in translation mode.
   // Only translated TTS chunks are routed to selected output sink.
-  if (passthroughToggle && passthroughToggle.checked) {
+  if (!ENFORCE_TARGET_ONLY_AUDIO && passthroughToggle && passthroughToggle.checked) {
     await startMonitorPassthrough(outputDeviceId);
   }
 }
@@ -456,6 +461,12 @@ startBtn.addEventListener('click', () => {
     return;
   }
 
+  const selectedOutputLabel = outputDeviceById.get(selectedOutput) || '';
+  if (!isVirtualLabel(selectedOutputLabel)) {
+    statusEl.textContent = 'Status: Choose CABLE Input/BlackHole as output so meeting gets only translated voice.';
+    return;
+  }
+
   if (!validateLanguages()) {
     return;
   }
@@ -470,11 +481,7 @@ startBtn.addEventListener('click', () => {
       stopBtn.disabled = false;
       clearTranscript();
       appendTranscriptLine('Listening for speech...', 'line-muted');
-      if (passthroughToggle && passthroughToggle.checked) {
-        statusEl.textContent = 'Status: Realtime translation active + mic passthrough test mode ON. Teams Mic must be CABLE Output.';
-      } else {
-        statusEl.textContent = 'Status: Realtime translation active. Teams Mic must be CABLE Output.';
-      }
+      statusEl.textContent = 'Status: Realtime translation active (target-only). Teams Mic must be CABLE Output.';
     })
     .catch((err) => {
       console.error(err);
@@ -498,6 +505,7 @@ async function loadDevices() {
     const mics = devices.filter((d) => d.kind === 'audioinput');
     const outputs = devices.filter((d) => d.kind === 'audiooutput');
     inputDeviceById = new Map(mics.map((d) => [d.deviceId, d.label || '']));
+    outputDeviceById = new Map(outputs.map((d) => [d.deviceId, d.label || '']));
 
     micSelect.innerHTML = '<option value="">-- Select Physical Mic --</option>';
     outputSelect.innerHTML = '<option value="">-- Select Virtual Output --</option>';
@@ -583,6 +591,12 @@ window.electronAPI.onTranslatedAudioDone(() => {
 window.addEventListener('beforeunload', () => {
   teardownAudioGraph();
 });
+
+if (passthroughToggle && ENFORCE_TARGET_ONLY_AUDIO) {
+  passthroughToggle.checked = false;
+  passthroughToggle.disabled = true;
+  passthroughToggle.title = 'Disabled in target-only mode to prevent source audio leakage.';
+}
 
 buildLanguageOptions();
 loadDevices();
