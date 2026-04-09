@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+venv/
+.venv/
+
+ui/node_modules
+ui/dist
+
+*.log
+*.ipynb
+agent-transcripts/
