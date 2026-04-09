@@ -1,0 +1,97 @@
+{"ts":"2026-04-09T04:47:22.678Z","event":"session_start","source_language":"en-IN","target_language":"hi-IN"}
+{"ts":"2026-04-09T04:47:22.694Z","event":"status","running":true,"message":"Realtime STT unavailable. Using REST STT fallback."}
+{"ts":"2026-04-09T04:47:22.699Z","event":"status","running":true,"message":"Pipeline started in REST continuous mode (en-IN -> hi-IN)."}
+{"ts":"2026-04-09T04:47:23.396Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:24.475Z","event":"segment_skipped_noise","raw_text":"..."}
+{"ts":"2026-04-09T04:47:24.807Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:26.223Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:27.631Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:42.633Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:54.254Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:55.689Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:57.788Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:58.494Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:59.197Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:47:59.911Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:04.152Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:04.647Z","event":"segment_skipped_noise","raw_text":"."}
+{"ts":"2026-04-09T04:48:04.861Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:05.568Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:06.284Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:06.996Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:07.701Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:08.408Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:08.887Z","event":"segment_received","segment_id":1,"source_text":"Oooh.","detected_language":"en-IN","latency":"rest"}
+{"ts":"2026-04-09T04:48:09.117Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:10.483Z","event":"segment_translated","segment_id":1,"source_language":"en-IN","target_language":"hi-IN","source_text":"Oooh.","translated_text":"ओह"}
+{"ts":"2026-04-09T04:48:12.563Z","event":"segment_tts","segment_id":1,"audio_bytes":97324,"mode":"rest"}
+{"ts":"2026-04-09T04:48:14.328Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:15.055Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:15.750Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:16.450Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:17.156Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:17.860Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:18.563Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:19.274Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:19.984Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:20.690Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:22.105Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:22.810Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:23.516Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:24.222Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:24.844Z","event":"segment_received","segment_id":2,"source_text":"Yeah, yeah.","detected_language":"en-IN","latency":"rest"}
+{"ts":"2026-04-09T04:48:24.946Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:25.990Z","event":"segment_translated","segment_id":2,"source_language":"en-IN","target_language":"hi-IN","source_text":"Yeah, yeah.","translated_text":"हां, हां।"}
+{"ts":"2026-04-09T04:48:26.357Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:27.071Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:27.232Z","event":"segment_tts","segment_id":2,"audio_bytes":20524,"mode":"rest"}
+{"ts":"2026-04-09T04:48:27.782Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:28.489Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:29.189Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:29.900Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:30.604Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:31.317Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:32.019Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:32.719Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:33.424Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:34.133Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:35.552Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:36.264Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:36.969Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:37.681Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:38.385Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:39.088Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:39.798Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:40.507Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:41.213Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:41.924Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:42.635Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:43.343Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:44.054Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:44.759Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:45.465Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:46.177Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:47.598Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:48.308Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:49.015Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:49.726Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:50.428Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:51.138Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:51.841Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:52.544Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:53.253Z","event":"segment_received","segment_id":3,"source_text":"Baa.","detected_language":"en-IN","latency":"rest"}
+{"ts":"2026-04-09T04:48:53.956Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:54.944Z","event":"segment_translated","segment_id":3,"source_language":"en-IN","target_language":"hi-IN","source_text":"Baa.","translated_text":"भेँ"}
+{"ts":"2026-04-09T04:48:55.372Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:55.849Z","event":"segment_tts","segment_id":3,"audio_bytes":25644,"mode":"rest"}
+{"ts":"2026-04-09T04:48:56.784Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:57.485Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:58.194Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:48:58.904Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:49:00.325Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:49:01.034Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:49:02.438Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:49:03.144Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:49:03.860Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:49:04.572Z","event":"status","running":true,"message":"REST STT processing segment..."}
+{"ts":"2026-04-09T04:49:05.285Z","event":"status","running":true,"message":"REST STT processing segment..."}
