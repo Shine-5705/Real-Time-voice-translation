@@ -1,3 +1,0 @@
-{"ts":"2026-04-08T06:28:39.273Z","event":"session_start","source_language":"en-IN","target_language":"hi-IN"}
-{"ts":"2026-04-08T06:28:39.730Z","event":"status","running":true,"message":"Pipeline started (en-IN -> hi-IN)."}
-{"ts":"2026-04-08T06:28:39.738Z","event":"status","running":true,"message":"Connected to STT. Speak now."}

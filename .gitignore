@@ -8,6 +8,7 @@ __pycache__/
 *.so
 gnani-translator-desktop\node_modules
 Video dubbing Gnani
+workdir
 # Distribution / packaging
 .Python
 build/
