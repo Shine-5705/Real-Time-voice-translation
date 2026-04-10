@@ -1,6 +1,9 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
+// Surface Chromium/electron diagnostics in the same terminal as the main process (when supported).
+app.commandLine.appendSwitch('enable-logging');
 const path = require('path');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 const WebSocket = require('ws');
 const dotenv = require('dotenv');
 
@@ -31,6 +34,8 @@ let restOverlapBuffer = Buffer.alloc(0);
 let lastEnqueuedTranscriptNorm = '';
 let ttsJobQueue = [];
 let ttsWorkerActive = false;
+let ttsWorkersInFlight = 0;
+const TTS_MAX_CONCURRENT = 4; // Enable parallel TTS execution
 let speechAggregationBuffer = [];
 let speechAggregationTimer = null;
 let speechAggregationStartedAt = 0;
@@ -44,11 +49,21 @@ function nowISO() {
 }
 
 function logInfo(message) {
-  console.log(`[${nowISO()}] ${message}`);
+  const line = `[${nowISO()}] ${message}\n`;
+  try {
+    process.stdout.write(line);
+  } catch (_e) {
+    console.log(line.trimEnd());
+  }
 }
 
 function logError(message) {
-  console.error(`[${nowISO()}] ${message}`);
+  const line = `[${nowISO()}] ${message}\n`;
+  try {
+    process.stderr.write(line);
+  } catch (_e) {
+    console.error(line.trimEnd());
+  }
 }
 
 function env(name, fallback = '') {
@@ -327,10 +342,10 @@ function getSpeechAggregationConfig() {
   // Rolling window (~1.5s): emit segments on silence, size cap, or max wait — similar in spirit to
   // vachana-translations continuous ASR + periodic finalization (see translation_session.py).
   return {
-    idleMs: Number(env('SPEECH_AGGREGATION_IDLE_MS', '1500')),
-    maxWaitMs: Number(env('SPEECH_AGGREGATION_MAX_WAIT_MS', '1500')),
-    minChars: Number(env('SPEECH_AGGREGATION_MIN_CHARS', '8')),
-    maxChars: Number(env('SPEECH_AGGREGATION_MAX_CHARS', '100')),
+    idleMs: Number(env('SPEECH_AGGREGATION_IDLE_MS', '900')),
+    maxWaitMs: Number(env('SPEECH_AGGREGATION_MAX_WAIT_MS', '1200')),
+    minChars: Number(env('SPEECH_AGGREGATION_MIN_CHARS', '6')),
+    maxChars: Number(env('SPEECH_AGGREGATION_MAX_CHARS', '110')),
   };
 }
 
@@ -469,10 +484,11 @@ function enqueueSpeechFragment(event, msg) {
   const shouldFlushSoon = isStrongTranscriptBoundary(fragment) || combined.length >= maxChars || ageMs >= maxWaitMs;
   const keepWaitingForContext = isLikelyIncompleteFragment(fragment) && ageMs < maxWaitMs;
 
+  const commitDelayMs = Number(env('SPEECH_AGGREGATION_COMMIT_MS', '90'));
   if (shouldFlushSoon && !keepWaitingForContext) {
-    scheduleSpeechAggregationFlush(120);
+    scheduleSpeechAggregationFlush(commitDelayMs);
   } else if (ageMs >= maxWaitMs) {
-    scheduleSpeechAggregationFlush(120);
+    scheduleSpeechAggregationFlush(commitDelayMs);
   } else {
     scheduleSpeechAggregationFlush(idleMs);
   }
@@ -525,6 +541,15 @@ function toVachanaLanguageCode(langCode) {
   };
 
   return map[lower] || normalized;
+}
+
+/** Vachana Realtime STT `lang_code` header — Hinglish Latin maps to en-IN. */
+function sttRealtimeLangCode(sourceLanguage) {
+  const lower = String(sourceLanguage || '').trim().toLowerCase();
+  if (lower.includes('latn') || lower === 'en-hi-in-latn') {
+    return 'en-IN';
+  }
+  return toVachanaLanguageCode(sourceLanguage);
 }
 
 function buildWavFromPcm16(pcmBytes, sampleRate = 16000, channels = 1, bitsPerSample = 16) {
@@ -732,7 +757,51 @@ async function translateText(text, sourceLanguage, targetLanguage, contextHint =
   return translateViaPublicFallback(text, sourceLanguage, targetLanguage);
 }
 
+/**
+ * Optional: Python REST TTS (same contract as synthesizeTTS below). Set VACHANA_TTS_USE_PYTHON=true.
+ * Script lives in this app folder: gnani-translator-desktop/scripts/tts_once.py
+ * Deps: pip install -r gnani-translator-desktop/scripts/requirements.txt
+ */
+function synthesizeTTSViaPythonSubprocess(text) {
+  const repoRoot = path.join(__dirname, '..');
+  const scriptPath = env('VACHANA_TTS_PYTHON_SCRIPT', '').trim()
+    || path.join(__dirname, 'scripts', 'tts_once.py');
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`VACHANA_TTS_USE_PYTHON set but script missing: ${scriptPath}`);
+  }
+  const pythonBin = env('VACHANA_PYTHON', 'python3');
+  const payload = JSON.stringify({ text: String(text || '') });
+  logInfo(`TTS Python subprocess: ${pythonBin} ${scriptPath}`);
+  const timeoutMs = Number(env('VACHANA_TTS_REST_TIMEOUT_MS', '120000'));
+  const result = spawnSync(pythonBin, [scriptPath], {
+    input: Buffer.from(payload, 'utf8'),
+    maxBuffer: 256 * 1024 * 1024,
+    cwd: repoRoot,
+    env: { ...process.env },
+    timeout: timeoutMs > 0 ? timeoutMs : undefined,
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.signal) {
+    throw new Error(`Python TTS killed (${result.signal})`);
+  }
+  if (result.status !== 0) {
+    const errText = result.stderr ? result.stderr.toString('utf8') : '';
+    throw new Error(`Python TTS failed (exit ${result.status}): ${errText.slice(0, 800)}`);
+  }
+  if (!result.stdout || result.stdout.length === 0) {
+    throw new Error('Python TTS returned empty audio');
+  }
+  logInfo(`TTS Python subprocess ok bytes=${result.stdout.length}`);
+  return Buffer.from(result.stdout);
+}
+
 async function synthesizeTTS(text) {
+  if (env('VACHANA_TTS_USE_PYTHON', 'false').toLowerCase() === 'true') {
+    return synthesizeTTSViaPythonSubprocess(text);
+  }
+
   const apiKey = env('VACHANA_API_KEY_ID');
   const sampleRate = Number(env('VACHANA_TTS_SAMPLE_RATE', '16000'));
   const voice = env('VACHANA_TTS_VOICE', 'sia');
@@ -744,7 +813,7 @@ async function synthesizeTTS(text) {
     env('VACHANA_TTS_ENDPOINT', '/api/v1/tts/inference'),
     ['/api/v1/tts/inference', '/api/v1/tts/rest', '/tts/rest', '/tts']
   );
-  const ttsTimeoutMs = Number(env('VACHANA_TTS_REST_TIMEOUT_MS', '45000'));
+  const ttsTimeoutMs = Number(env('VACHANA_TTS_REST_TIMEOUT_MS', '120000'));
 
   let lastError = 'unknown';
   for (const endpoint of endpoints) {
@@ -796,6 +865,99 @@ async function synthesizeTTS(text) {
   }
 
   throw new Error(`TTS failed for all endpoints: ${lastError}`);
+}
+
+function hardSplitLongTts(segment, maxChars) {
+  segment = String(segment || '').trim();
+  if (!segment) {
+    return [];
+  }
+  if (segment.length <= maxChars) {
+    return [segment];
+  }
+  const out = [];
+  let start = 0;
+  while (start < segment.length) {
+    let end = Math.min(start + maxChars, segment.length);
+    if (end < segment.length) {
+      const slice = segment.slice(start, end);
+      const sp = slice.lastIndexOf(' ');
+      if (sp > maxChars / 4) {
+        end = start + sp;
+      }
+    }
+    if (end <= start) {
+      end = Math.min(start + maxChars, segment.length);
+    }
+    const piece = segment.slice(start, end).trim();
+    if (piece) {
+      out.push(piece);
+    }
+    start = end;
+  }
+  return out;
+}
+
+function splitTextForSequentialTts(text) {
+  const maxChars = Math.max(48, Number(env('VACHANA_TTS_MAX_CHARS_PER_CHUNK', '120')));
+  const enabled = env('VACHANA_TTS_SEQUENTIAL_CHUNKING', 'true').toLowerCase() === 'true';
+  if (!enabled) {
+    return [String(text || '').trim()].filter(Boolean);
+  }
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) {
+    return [];
+  }
+  if (t.length <= maxChars) {
+    return [t];
+  }
+  const rawParts = t.split(/(?<=[.!?…।])\s+/);
+  const parts = rawParts.map((p) => p.trim()).filter(Boolean);
+  const chunks = [];
+  let buf = '';
+  for (const p of parts) {
+    if (p.length > maxChars) {
+      if (buf) {
+        chunks.push(buf.trim());
+        buf = '';
+      }
+      chunks.push(...hardSplitLongTts(p, maxChars));
+      continue;
+    }
+    const candidate = buf ? `${buf} ${p}`.trim() : p;
+    if (candidate.length <= maxChars) {
+      buf = candidate;
+    } else {
+      if (buf) {
+        chunks.push(buf.trim());
+      }
+      buf = p;
+    }
+  }
+  if (buf) {
+    chunks.push(buf.trim());
+  }
+  return chunks.filter(Boolean);
+}
+
+async function synthesizeRestTtsSequentialToRenderer(translatedText, event) {
+  const parts = splitTextForSequentialTts(translatedText);
+  if (parts.length > 1) {
+    logInfo(
+      `TTS sequential REST: ${parts.length} chunk(s), max_chars=${env('VACHANA_TTS_MAX_CHARS_PER_CHUNK', '120')} `
+      + '(next chunk requests while earlier audio is queued)',
+    );
+  }
+  let totalBytes = 0;
+  for (let i = 0; i < parts.length; i += 1) {
+    const audioBuffer = await synthesizeTTS(parts[i]);
+    totalBytes += audioBuffer.length;
+    event.sender.send('translated-audio', {
+      mimeType: 'audio/wav',
+      audioBase64: audioBuffer.toString('base64'),
+    });
+  }
+  return totalBytes;
 }
 
 function streamTTSRealtime({ endpoint, apiKey, text, model, sampleRate, container, voice, onChunk }) {
@@ -1060,7 +1222,9 @@ async function processTtsJobQueue() {
     const ttsQueueWaitMs = elapsedMs(segmentStartMs) - Number(translateElapsedMs || 0);
 
     try {
-      const ttsRealtimeEnabled = env('ENABLE_TTS_REALTIME_WS', 'true').toLowerCase() === 'true';
+      // Default false: REST returns full WAV per chunk (matches gnani-translator-desktop-py). WS streaming
+      // sends raw PCM fragments — renderer stitch + timing can sound worse; set ENABLE_TTS_REALTIME_WS=true for lower-latency stream.
+      const ttsRealtimeEnabled = env('ENABLE_TTS_REALTIME_WS', 'false').toLowerCase() === 'true';
       const ttsStartMs = Date.now();
       if (ttsRealtimeEnabled) {
         const ttsRealtimeEndpoint = env('VACHANA_TTS_REALTIME_ENDPOINT', 'wss://api.vachana.ai/api/v1/tts');
@@ -1113,14 +1277,10 @@ async function processTtsJobQueue() {
           }
 
           logError(`TTS realtime failed; using REST fallback: ${wsError.message}`);
-          const audioBuffer = await synthesizeTTS(translatedText);
-          event.sender.send('translated-audio', {
-            mimeType: 'audio/wav',
-            audioBase64: audioBuffer.toString('base64'),
-          });
+          const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event);
           writeEvent('segment_tts', {
             segment_id: segmentId,
-            audio_bytes: audioBuffer.length,
+            audio_bytes: audioBytes,
             mode: 'rest-fallback',
             realtime_error: wsError.message,
           });
@@ -1131,14 +1291,10 @@ async function processTtsJobQueue() {
           );
         }
       } else {
-        const audioBuffer = await synthesizeTTS(translatedText);
-        event.sender.send('translated-audio', {
-          mimeType: 'audio/wav',
-          audioBase64: audioBuffer.toString('base64'),
-        });
+        const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event);
         writeEvent('segment_tts', {
           segment_id: segmentId,
-          audio_bytes: audioBuffer.length,
+          audio_bytes: audioBytes,
           mode: 'rest',
         });
         logInfo(
@@ -1196,20 +1352,23 @@ function enqueueTranscript(event, msg) {
 
 function connectSTT(event, sourceLanguage) {
   return new Promise((resolve, reject) => {
-    const endpoint = env('VACHANA_STT_REALTIME_ENDPOINT', 'wss://api.vachana.ai/stt/v3').trim();
+    const endpoint = env('VACHANA_STT_REALTIME_ENDPOINT', 'wss://api.vachana.ai/stt/v3/stream').trim();
     const apiKey = env('VACHANA_API_KEY_ID').trim();
     if (!apiKey) {
       reject(new Error('VACHANA_API_KEY_ID missing in .env'));
       return;
     }
 
+    const langOverride = env('VACHANA_STT_LANG_CODE', '').trim();
+    const langCode = langOverride || sttRealtimeLangCode(sourceLanguage);
     const includeLanguageHeader = env('VACHANA_STT_INCLUDE_LANGUAGE_HEADER', 'false').toLowerCase() === 'true';
     const headers = {
       'x-api-key-id': apiKey,
+      lang_code: langCode,
     };
 
-    if (includeLanguageHeader && sourceLanguage) {
-      headers['x-language-code'] = sourceLanguage;
+    if (includeLanguageHeader) {
+      headers['x-language-code'] = langCode;
     }
 
     logInfo(`Connecting STT websocket to ${endpoint}`);
@@ -1361,6 +1520,7 @@ function teardownPipeline() {
   queueProcessing = false;
   ttsJobQueue = [];
   ttsWorkerActive = false;
+  ttsWorkersInFlight = 0;
   speechAggregationBuffer = [];
   speechAggregationEvent = null;
   speechAggregationStartedAt = 0;
@@ -1459,7 +1619,7 @@ ipcMain.on('start-translation', (event, config = {}) => {
     }
   }, 5000);
 
-  const sttModePref = env('VACHANA_STT_MODE', 'rest').toLowerCase();
+  const sttModePref = env('VACHANA_STT_MODE', 'ws').toLowerCase();
   if (sttModePref === 'rest') {
     translationRunning = true;
     sttMode = 'rest';
