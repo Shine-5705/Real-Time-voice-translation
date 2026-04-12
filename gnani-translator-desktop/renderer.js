@@ -8,8 +8,19 @@ const targetLangSelect = document.getElementById('targetLang');
 const transcriptBox = document.getElementById('transcriptBox');
 const passthroughToggle = document.getElementById('passthroughToggle');
 const guestSpeakerToggle = document.getElementById('guestSpeakerToggle');
+const bidirectionalToggle = document.getElementById('bidirectionalToggle');
+const bidirectionalOpts = document.getElementById('bidirectionalOpts');
+const listenSelect = document.getElementById('listenSelect');
+const localOutputSelect = document.getElementById('localOutputSelect');
 
 let inputStream = null;
+let returnInputStream = null;
+let returnAudioContext = null;
+let returnSourceNode = null;
+let returnProcessorNode = null;
+let returnSilentGainNode = null;
+let returnHighpassNode = null;
+let returnLowpassNode = null;
 let monitorAudio = null;
 let audioContext = null;
 let sourceNode = null;
@@ -18,11 +29,15 @@ let silentGainNode = null;
 let highpassNode = null;
 let lowpassNode = null;
 let pcmBuffer = new Int16Array(0);
+let returnPcmBuffer = new Int16Array(0);
 let selectedOutputSinkId = '';
+let selectedLocalOutputSinkId = '';
 const playbackQueue = [];
 let playbackActive = false;
 let sttFrameQueue = [];
 let sttSendTimer = null;
+let returnSttFrameQueue = [];
+let returnSttSendTimer = null;
 let lastMicTelemetryTs = 0;
 let inputDeviceById = new Map();
 let outputDeviceById = new Map();
@@ -35,10 +50,17 @@ const MIC_NOISE_SUPPRESSION = true;
 const MIC_AUTO_GAIN_CONTROL = true;
 const MIC_NOISE_GATE_THRESHOLD = 0.008;
 const MIC_NOISE_GATE_SOFT_GAIN = 0.12;
+/** Energy gate: pass frames clearly above an adapting noise floor (reduces TV/room bleed). */
+const MIC_ADAPTIVE_GATE_ENABLED = true;
+const MIC_ADAPTIVE_SPEECH_DB = 12;
+const MIC_ADAPTIVE_HANGOVER_FRAMES = 4;
+const MIC_ADAPTIVE_FLOOR_LEAK = 0.04;
+let adaptiveNoiseFloor = 0.002;
+let adaptiveHangoverLeft = 0;
 const MIC_HIGHPASS_HZ = 120;
 const MIC_LOWPASS_HZ = 3800;
 let ttsChunkBytesQueue = [];
-let ttsChunkMeta = { sampleRate: 16000, numChannels: 1, sampleWidth: 2 };
+let ttsChunkMeta = { sampleRate: 16000, numChannels: 1, sampleWidth: 2, channel: 'meeting' };
 let ttsAggregateTimer = null;
 
 const LANGUAGES = [
@@ -110,6 +132,28 @@ function applyGain(floatArray, gain) {
   return out;
 }
 
+function applyAdaptiveSpeechGate(floatArray) {
+  if (!MIC_ADAPTIVE_GATE_ENABLED) {
+    return floatArray;
+  }
+  const rms = computeRms(floatArray);
+  const mult = 10 ** (MIC_ADAPTIVE_SPEECH_DB / 20);
+  const thr = Math.max(adaptiveNoiseFloor * mult, 1e-5);
+  const isSpeech = rms >= thr;
+  if (!isSpeech && rms < thr * 0.4) {
+    adaptiveNoiseFloor = adaptiveNoiseFloor * (1 - MIC_ADAPTIVE_FLOOR_LEAK) + rms * MIC_ADAPTIVE_FLOOR_LEAK;
+  }
+  if (isSpeech || adaptiveHangoverLeft > 0) {
+    if (isSpeech) {
+      adaptiveHangoverLeft = MIC_ADAPTIVE_HANGOVER_FRAMES;
+    } else {
+      adaptiveHangoverLeft -= 1;
+    }
+    return floatArray;
+  }
+  return new Float32Array(floatArray.length);
+}
+
 function applySoftNoiseGate(floatArray) {
   const rms = computeRms(floatArray);
   if (rms < MIC_NOISE_GATE_THRESHOLD * 0.5) {
@@ -165,6 +209,16 @@ function sendPCMToSTT(newPCM) {
   }
 }
 
+function sendPCMToSTTReturn(newPCM) {
+  returnPcmBuffer = concatInt16(returnPcmBuffer, newPCM);
+  while (returnPcmBuffer.length >= 512) {
+    const frame = returnPcmBuffer.slice(0, 512);
+    returnPcmBuffer = returnPcmBuffer.slice(512);
+    const bytes = new Uint8Array(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength));
+    returnSttFrameQueue.push(bytes);
+  }
+}
+
 function computeRms(floatArray) {
   let sumSquares = 0;
   for (let i = 0; i < floatArray.length; i++) {
@@ -209,6 +263,28 @@ function stopPacedSttSender() {
     sttSendTimer = null;
   }
   sttFrameQueue = [];
+}
+
+function startPacedReturnSttSender() {
+  stopPacedReturnSttSender();
+  returnSttSendTimer = setInterval(() => {
+    if (returnSttFrameQueue.length === 0) {
+      return;
+    }
+    const frame = returnSttFrameQueue.shift();
+    if (window.electronAPI.sendAudioChunkReturn) {
+      window.electronAPI.sendAudioChunkReturn(frame);
+    }
+  }, 32);
+}
+
+function stopPacedReturnSttSender() {
+  if (returnSttSendTimer) {
+    clearInterval(returnSttSendTimer);
+    returnSttSendTimer = null;
+  }
+  returnSttFrameQueue = [];
+  returnPcmBuffer = new Int16Array(0);
 }
 
 function base64ToBlob(base64, mimeType) {
@@ -279,10 +355,12 @@ async function playNextAudioInQueue() {
   const item = playbackQueue.shift();
   const audioEl = new Audio();
   audioEl.src = item.url;
+  const channel = item.channel || 'meeting';
 
   try {
-    if (typeof audioEl.setSinkId === 'function' && selectedOutputSinkId) {
-      await audioEl.setSinkId(selectedOutputSinkId);
+    const sinkId = channel === 'local' ? selectedLocalOutputSinkId : selectedOutputSinkId;
+    if (typeof audioEl.setSinkId === 'function' && sinkId) {
+      await audioEl.setSinkId(sinkId);
     }
 
     await audioEl.play();
@@ -343,7 +421,8 @@ function flushAggregatedTtsChunks(force = false) {
     ttsChunkMeta.sampleWidth
   );
   const url = URL.createObjectURL(blob);
-  playbackQueue.push({ url });
+  const ch = ttsChunkMeta.channel || 'meeting';
+  playbackQueue.push({ url, channel: ch });
   playNextAudioInQueue();
 }
 
@@ -352,6 +431,7 @@ function isVirtualLabel(label) {
 }
 
 function teardownAudioGraph() {
+  teardownListenGraph();
   stopPacedSttSender();
   stopTtsAggregateTimer();
   ttsChunkBytesQueue = [];
@@ -425,9 +505,98 @@ async function startMonitorPassthrough(outputDeviceId) {
   await monitorAudio.play();
 }
 
-async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
+function teardownListenGraph() {
+  stopPacedReturnSttSender();
+
+  if (returnProcessorNode) {
+    returnProcessorNode.disconnect();
+    returnProcessorNode.onaudioprocess = null;
+    returnProcessorNode = null;
+  }
+
+  if (returnSourceNode) {
+    returnSourceNode.disconnect();
+    returnSourceNode = null;
+  }
+
+  if (returnHighpassNode) {
+    returnHighpassNode.disconnect();
+    returnHighpassNode = null;
+  }
+
+  if (returnLowpassNode) {
+    returnLowpassNode.disconnect();
+    returnLowpassNode = null;
+  }
+
+  if (returnAudioContext) {
+    returnAudioContext.close();
+    returnAudioContext = null;
+  }
+
+  returnSilentGainNode = null;
+
+  if (returnInputStream) {
+    returnInputStream.getTracks().forEach((t) => t.stop());
+    returnInputStream = null;
+  }
+}
+
+async function startListenPipeline(listenDeviceId) {
+  teardownListenGraph();
+  startPacedReturnSttSender();
+
+  const supported = (navigator.mediaDevices && navigator.mediaDevices.getSupportedConstraints)
+    ? navigator.mediaDevices.getSupportedConstraints()
+    : {};
+  const audioConstraints = {
+    deviceId: { exact: listenDeviceId },
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: true,
+    channelCount: 1,
+    sampleRate: 16000,
+  };
+  returnInputStream = await navigator.mediaDevices.getUserMedia({
+    audio: audioConstraints,
+    video: false,
+  });
+
+  returnAudioContext = new AudioContext({ sampleRate: 16000 });
+  returnSourceNode = returnAudioContext.createMediaStreamSource(returnInputStream);
+  returnHighpassNode = returnAudioContext.createBiquadFilter();
+  returnHighpassNode.type = 'highpass';
+  returnHighpassNode.frequency.value = MIC_HIGHPASS_HZ;
+
+  returnLowpassNode = returnAudioContext.createBiquadFilter();
+  returnLowpassNode.type = 'lowpass';
+  returnLowpassNode.frequency.value = MIC_LOWPASS_HZ;
+
+  returnProcessorNode = returnAudioContext.createScriptProcessor(1024, 1, 1);
+  returnSilentGainNode = returnAudioContext.createGain();
+  returnSilentGainNode.gain.value = 0;
+
+  returnProcessorNode.onaudioprocess = (e) => {
+    const inputRate = e.inputBuffer.sampleRate || returnAudioContext.sampleRate || TARGET_SAMPLE_RATE;
+    const channel = e.inputBuffer.getChannelData(0);
+    const resampled = resampleTo16k(channel, inputRate);
+    const gated = applySoftNoiseGate(resampled);
+    const boosted = applyGain(gated, PREAMP_GAIN);
+    sendPCMToSTTReturn(toInt16(boosted));
+  };
+
+  returnSourceNode.connect(returnHighpassNode);
+  returnHighpassNode.connect(returnLowpassNode);
+  returnLowpassNode.connect(returnProcessorNode);
+  returnProcessorNode.connect(returnSilentGainNode);
+  returnSilentGainNode.connect(returnAudioContext.destination);
+}
+
+async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}) {
   teardownAudioGraph();
+  const { bidirectional = false, listenDeviceId = '' } = options;
   selectedOutputSinkId = outputDeviceId;
+  selectedLocalOutputSinkId = options.localOutputSinkId || '';
   startPacedSttSender();
   startTtsAggregateTimer();
 
@@ -469,7 +638,8 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
     const inputRate = e.inputBuffer.sampleRate || audioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
-    const gated = applySoftNoiseGate(resampled);
+    const adaptive = applyAdaptiveSpeechGate(resampled);
+    const gated = applySoftNoiseGate(adaptive);
     const boosted = applyGain(gated, PREAMP_GAIN);
     emitMicTelemetry(boosted);
     sendPCMToSTT(toInt16(boosted));
@@ -486,6 +656,10 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId) {
   // Only translated TTS chunks are routed to selected output sink.
   if (!ENFORCE_TARGET_ONLY_AUDIO && passthroughToggle && passthroughToggle.checked) {
     await startMonitorPassthrough(outputDeviceId);
+  }
+
+  if (bidirectional && listenDeviceId) {
+    await startListenPipeline(listenDeviceId);
   }
 }
 
@@ -523,22 +697,50 @@ startBtn.addEventListener('click', () => {
     return;
   }
 
+  const bidir = Boolean(bidirectionalToggle && bidirectionalToggle.checked);
+  let listenDeviceId = '';
+  let localOutId = '';
+  if (bidir) {
+    listenDeviceId = listenSelect ? listenSelect.value : '';
+    localOutId = localOutputSelect ? localOutputSelect.value : '';
+    if (!listenDeviceId || !localOutId) {
+      statusEl.textContent = 'Status: Bidirectional mode needs loopback input and headphones output.';
+      return;
+    }
+    const localLabel = outputDeviceById.get(localOutId) || '';
+    if (isVirtualLabel(localLabel)) {
+      statusEl.textContent = 'Status: For team speech playback, pick real speakers/headphones — not the virtual cable.';
+      return;
+    }
+    if (listenDeviceId === selectedMic) {
+      statusEl.textContent = 'Status: Loopback device must differ from your microphone.';
+      return;
+    }
+  }
+
   if (!validateLanguages()) {
     return;
   }
 
-  startRealtimePipeline(selectedMic, selectedOutput)
+  startRealtimePipeline(selectedMic, selectedOutput, {
+    bidirectional: bidir,
+    listenDeviceId,
+    localOutputSinkId: localOutId,
+  })
     .then(() => {
       window.electronAPI.startTranslation({
         sourceLanguage: sourceLangSelect.value,
         targetLanguage: targetLangSelect.value,
         speakerPreferenceMode: guestSpeakerToggle && guestSpeakerToggle.checked ? 'lock_first' : 'off',
+        bidirectional: bidir,
       });
       startBtn.disabled = true;
       stopBtn.disabled = false;
       clearTranscript();
       appendTranscriptLine('Listening for speech...', 'line-muted');
-      statusEl.textContent = 'Status: Realtime translation active (target-only). Teams Mic must be CABLE Output.';
+      statusEl.textContent = bidir
+        ? 'Status: Bidirectional — your speech → meeting (virtual output); team speech → headphones.'
+        : 'Status: Realtime translation active (target-only). Teams Mic must be CABLE Output.';
     })
     .catch((err) => {
       console.error(err);
@@ -566,6 +768,12 @@ async function loadDevices() {
 
     micSelect.innerHTML = '<option value="">-- Select Physical Mic --</option>';
     outputSelect.innerHTML = '<option value="">-- Select Virtual Output --</option>';
+    if (listenSelect) {
+      listenSelect.innerHTML = '<option value="">-- Select loopback / mix input --</option>';
+    }
+    if (localOutputSelect) {
+      localOutputSelect.innerHTML = '<option value="">-- Select physical output --</option>';
+    }
 
     mics.forEach((dev) => {
       const opt = document.createElement('option');
@@ -573,6 +781,12 @@ async function loadDevices() {
       const label = dev.label || `Microphone ${dev.deviceId.slice(0, 8)}...`;
       opt.textContent = isVirtualLabel(label) ? `Virtual Device: ${label}` : label;
       micSelect.appendChild(opt);
+      if (listenSelect) {
+        const lopt = document.createElement('option');
+        lopt.value = dev.deviceId;
+        lopt.textContent = opt.textContent;
+        listenSelect.appendChild(lopt);
+      }
     });
 
     outputs.forEach((dev) => {
@@ -581,6 +795,12 @@ async function loadDevices() {
       const label = dev.label || `Speaker ${dev.deviceId.slice(0, 8)}...`;
       opt.textContent = isVirtualLabel(label) ? `Virtual Device: ${label}` : label;
       outputSelect.appendChild(opt);
+      if (localOutputSelect) {
+        const lout = document.createElement('option');
+        lout.value = dev.deviceId;
+        lout.textContent = label;
+        localOutputSelect.appendChild(lout);
+      }
     });
 
     const preferredOutput = outputs.find((d) => isVirtualLabel(d.label || ''));
@@ -594,6 +814,16 @@ async function loadDevices() {
     const preferredMic = mics.find((d) => !isVirtualLabel(d.label || ''));
     if (preferredMic) {
       micSelect.value = preferredMic.deviceId;
+    }
+
+    const preferredLoopback = mics.find((d) => /blackhole|stereo mix|loopback|cable output/i.test(d.label || ''));
+    if (listenSelect && preferredLoopback) {
+      listenSelect.value = preferredLoopback.deviceId;
+    }
+
+    const preferredHeadphones = outputs.find((d) => !isVirtualLabel(d.label || ''));
+    if (localOutputSelect && preferredHeadphones) {
+      localOutputSelect.value = preferredHeadphones.deviceId;
     }
 
     if (mics.length === 0 || outputs.length === 0) {
@@ -617,6 +847,14 @@ window.electronAPI.onTranslationStatus((payload) => {
 
 window.electronAPI.onTranscript((payload) => {
   const spk = payload.speakerId ? ` [${payload.speakerId}]` : '';
+  if (payload.incoming) {
+    if (payload.translated) {
+      appendTranscriptLine(`You hear (source)${spk}: ${payload.text}`, 'line-muted');
+    } else {
+      appendTranscriptLine(`Team (target)${spk}: ${payload.text}`);
+    }
+    return;
+  }
   if (payload.translated) {
     appendTranscriptLine(`Translated${spk}: ${payload.text}`);
   } else {
@@ -627,7 +865,8 @@ window.electronAPI.onTranscript((payload) => {
 window.electronAPI.onTranslatedAudio((payload) => {
   const blob = base64ToBlob(payload.audioBase64, payload.mimeType);
   const url = URL.createObjectURL(blob);
-  playbackQueue.push({ url });
+  const channel = payload.channel || 'meeting';
+  playbackQueue.push({ url, channel });
   playNextAudioInQueue();
 });
 
@@ -637,12 +876,16 @@ window.electronAPI.onTranslatedAudioChunk((payload) => {
     sampleRate: payload.sampleRate || 16000,
     numChannels: payload.numChannels || 1,
     sampleWidth: payload.sampleWidth || 2,
+    channel: payload.channel || 'meeting',
   };
   ttsChunkBytesQueue.push(bytes);
   flushAggregatedTtsChunks(false);
 });
 
-window.electronAPI.onTranslatedAudioDone(() => {
+window.electronAPI.onTranslatedAudioDone((payload) => {
+  if (payload && payload.channel) {
+    ttsChunkMeta = { ...ttsChunkMeta, channel: payload.channel };
+  }
   flushAggregatedTtsChunks(true);
 });
 
@@ -654,6 +897,12 @@ if (passthroughToggle && ENFORCE_TARGET_ONLY_AUDIO) {
   passthroughToggle.checked = false;
   passthroughToggle.disabled = true;
   passthroughToggle.title = 'Disabled in target-only mode to prevent source audio leakage.';
+}
+
+if (bidirectionalToggle && bidirectionalOpts) {
+  bidirectionalToggle.addEventListener('change', () => {
+    bidirectionalOpts.style.display = bidirectionalToggle.checked ? 'block' : 'none';
+  });
 }
 
 buildLanguageOptions();

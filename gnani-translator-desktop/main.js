@@ -12,6 +12,7 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
 let mainWindow;
 let translationRunning = false;
 let sttSocket = null;
+let sttSocketReturn = null;
 let activeConfig = null;
 let sttMode = 'ws';
 let restAudioBuffer = [];
@@ -32,6 +33,7 @@ let sttHealthTimer = null;
 let wsHealthFailoverTriggered = false;
 let restOverlapBuffer = Buffer.alloc(0);
 let lastEnqueuedTranscriptNorm = '';
+let lastEnqueuedTranscriptNormIncoming = '';
 let ttsJobQueue = [];
 let ttsWorkerActive = false;
 let ttsWorkersInFlight = 0;
@@ -42,7 +44,13 @@ let speechAggregationStartedAt = 0;
 let speechAggregationEvent = null;
 let recentSourceContext = [];
 let recentTargetContext = [];
+let recentIncomingSourceContext = [];
+let recentIncomingTargetContext = [];
 let lockedPreferredSpeakerId = null;
+let speechAggregationBufferIncoming = [];
+let speechAggregationTimerIncoming = null;
+let speechAggregationStartedAtIncoming = 0;
+let speechAggregationEventIncoming = null;
 
 function nowISO() {
   return new Date().toISOString();
@@ -222,6 +230,18 @@ function getContextHint() {
   return {
     source: recentSourceContext.join(' '),
     target: recentTargetContext.join(' '),
+  };
+}
+
+function getContextHintReverse() {
+  const enabled = env('ENABLE_CONTEXTUAL_TRANSLATION', 'true').toLowerCase() === 'true';
+  if (!enabled) {
+    return { source: '', target: '' };
+  }
+
+  return {
+    source: recentIncomingSourceContext.join(' '),
+    target: recentIncomingTargetContext.join(' '),
   };
 }
 
@@ -491,6 +511,152 @@ function enqueueSpeechFragment(event, msg) {
     scheduleSpeechAggregationFlush(commitDelayMs);
   } else {
     scheduleSpeechAggregationFlush(idleMs);
+  }
+}
+
+function clearSpeechAggregationTimerIncoming() {
+  if (speechAggregationTimerIncoming) {
+    clearTimeout(speechAggregationTimerIncoming);
+    speechAggregationTimerIncoming = null;
+  }
+}
+
+function rescheduleIncomingAggregationIfPending() {
+  if (speechAggregationBufferIncoming.length === 0 || !speechAggregationStartedAtIncoming) {
+    return;
+  }
+  const { idleMs, maxWaitMs } = getSpeechAggregationConfig();
+  const ageMs = Date.now() - speechAggregationStartedAtIncoming;
+  const untilWindowEnd = maxWaitMs - ageMs;
+  if (untilWindowEnd <= 0) {
+    scheduleIncomingSpeechAggregationFlush(0);
+    return;
+  }
+  const delay = Math.min(idleMs, untilWindowEnd);
+  scheduleIncomingSpeechAggregationFlush(Math.max(80, delay));
+}
+
+function flushIncomingSpeechAggregationBuffer(force = false) {
+  if (speechAggregationBufferIncoming.length === 0) {
+    clearSpeechAggregationTimerIncoming();
+    speechAggregationStartedAtIncoming = 0;
+    speechAggregationEventIncoming = null;
+    return;
+  }
+
+  const { minChars, maxWaitMs } = getSpeechAggregationConfig();
+  const ageMs = speechAggregationStartedAtIncoming ? Date.now() - speechAggregationStartedAtIncoming : 0;
+  const windowExceeded = ageMs >= maxWaitMs;
+  const effectiveForce = force || windowExceeded;
+
+  const combined = speechAggregationBufferIncoming
+    .map((item) => item.text)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!effectiveForce) {
+    if (combined.length < minChars && !isStrongTranscriptBoundary(combined)) {
+      rescheduleIncomingAggregationIfPending();
+      return;
+    }
+
+    if (!isStrongTranscriptBoundary(combined) && isLikelyIncompleteFragment(combined)) {
+      rescheduleIncomingAggregationIfPending();
+      return;
+    }
+
+    const tailFragment = speechAggregationBufferIncoming[speechAggregationBufferIncoming.length - 1]?.text || '';
+    if (speechAggregationBufferIncoming.length < 3 && isLikelyIncompleteFragment(tailFragment)) {
+      rescheduleIncomingAggregationIfPending();
+      return;
+    }
+  } else if (windowExceeded && combined && !isMeaningfulTranscript(combined)) {
+    speechAggregationBufferIncoming = [];
+    clearSpeechAggregationTimerIncoming();
+    speechAggregationStartedAtIncoming = 0;
+    speechAggregationEventIncoming = null;
+    return;
+  }
+
+  const event = speechAggregationEventIncoming || speechAggregationBufferIncoming[0].event;
+  const detectedLanguage = speechAggregationBufferIncoming[0].detectedLanguage || activeConfig?.targetLanguage || 'unknown';
+  const receivedAt = speechAggregationBufferIncoming[0].receivedAt || nowISO();
+  const aggregatedCount = speechAggregationBufferIncoming.length;
+  const segmentSpeakerId = speechAggregationBufferIncoming.map((x) => x.speakerId).find((s) => s && String(s).trim()) || '';
+
+  speechAggregationBufferIncoming = [];
+  clearSpeechAggregationTimerIncoming();
+  speechAggregationStartedAtIncoming = 0;
+  speechAggregationEventIncoming = null;
+
+  if (!combined) {
+    return;
+  }
+
+  segmentCounter += 1;
+  transcriptQueue.push({
+    id: segmentCounter,
+    event,
+    text: combined,
+    detectedLanguage,
+    speakerId: segmentSpeakerId,
+    latency: 'aggregated-incoming',
+    receivedAt,
+    aggregatedCount,
+    createdAtMs: Date.now(),
+    direction: 'in',
+  });
+
+  logInfo(`QUEUE pushed incoming segment=${segmentCounter} fragments=${aggregatedCount} pending=${transcriptQueue.length}`);
+  processTranscriptQueue().catch((err) => {
+    logError(`QUEUE ERROR: ${err.message}`);
+  });
+}
+
+function scheduleIncomingSpeechAggregationFlush(delayMs) {
+  clearSpeechAggregationTimerIncoming();
+  speechAggregationTimerIncoming = setTimeout(() => {
+    flushIncomingSpeechAggregationBuffer(false);
+  }, delayMs);
+}
+
+function enqueueIncomingSpeechFragment(event, msg) {
+  const fragment = String(msg.text || '').trim();
+  if (!fragment) {
+    return;
+  }
+
+  if (!speechAggregationStartedAtIncoming) {
+    speechAggregationStartedAtIncoming = Date.now();
+  }
+
+  speechAggregationEventIncoming = event;
+  speechAggregationBufferIncoming.push({
+    text: fragment,
+    detectedLanguage: msg.detected_language || activeConfig?.targetLanguage || 'unknown',
+    speakerId: extractSpeakerIdFromStt(msg),
+    receivedAt: nowISO(),
+    event,
+  });
+
+  const { idleMs, maxWaitMs, maxChars } = getSpeechAggregationConfig();
+  const combined = speechAggregationBufferIncoming
+    .map((item) => item.text)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const ageMs = Date.now() - speechAggregationStartedAtIncoming;
+  const shouldFlushSoon = isStrongTranscriptBoundary(fragment) || combined.length >= maxChars || ageMs >= maxWaitMs;
+  const keepWaitingForContext = isLikelyIncompleteFragment(fragment) && ageMs < maxWaitMs;
+
+  const commitDelayMs = Number(env('SPEECH_AGGREGATION_COMMIT_MS', '90'));
+  if (shouldFlushSoon && !keepWaitingForContext) {
+    scheduleIncomingSpeechAggregationFlush(commitDelayMs);
+  } else if (ageMs >= maxWaitMs) {
+    scheduleIncomingSpeechAggregationFlush(commitDelayMs);
+  } else {
+    scheduleIncomingSpeechAggregationFlush(idleMs);
   }
 }
 
@@ -940,7 +1106,7 @@ function splitTextForSequentialTts(text) {
   return chunks.filter(Boolean);
 }
 
-async function synthesizeRestTtsSequentialToRenderer(translatedText, event) {
+async function synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel = 'meeting') {
   const parts = splitTextForSequentialTts(translatedText);
   if (parts.length > 1) {
     logInfo(
@@ -955,6 +1121,7 @@ async function synthesizeRestTtsSequentialToRenderer(translatedText, event) {
     event.sender.send('translated-audio', {
       mimeType: 'audio/wav',
       audioBase64: audioBuffer.toString('base64'),
+      channel: playbackChannel,
     });
   }
   return totalBytes;
@@ -1068,11 +1235,22 @@ async function processTranscriptQueue() {
       const segmentStartMs = Number(item.createdAtMs || Date.now());
 
       try {
-        logInfo(`STT(${item.detectedLanguage}, latency=${item.latency}ms): ${item.text}`);
+        const isIncoming = item.direction === 'in';
+        logInfo(
+          isIncoming
+            ? `STT-IN(${item.detectedLanguage}, ${item.latency}): ${item.text}`
+            : `STT(${item.detectedLanguage}, ${item.latency}): ${item.text}`
+        );
 
         if (sessionArtifacts) {
-          appendLine(sessionArtifacts.sourceLogPath, `[${item.receivedAt}] seg=${item.id} ${item.detectedLanguage} :: ${item.text}`);
-          appendLine(sessionArtifacts.spokenTextPath, item.text);
+          const tag = isIncoming ? '[incoming] ' : '';
+          appendLine(
+            sessionArtifacts.sourceLogPath,
+            `[${item.receivedAt}] ${tag}seg=${item.id} ${item.detectedLanguage} :: ${item.text}`
+          );
+          if (!isIncoming) {
+            appendLine(sessionArtifacts.spokenTextPath, item.text);
+          }
         }
 
         writeEvent('segment_received', {
@@ -1080,6 +1258,7 @@ async function processTranscriptQueue() {
           source_text: item.text,
           detected_language: item.detectedLanguage,
           latency: item.latency,
+          direction: isIncoming ? 'incoming' : 'outgoing',
         });
 
         event.sender.send('transcript', {
@@ -1087,19 +1266,34 @@ async function processTranscriptQueue() {
           detectedLanguage: item.detectedLanguage,
           latency: item.latency,
           speakerId: item.speakerId || '',
+          incoming: isIncoming,
         });
 
         const configuredSourceLanguage = activeConfig?.sourceLanguage;
-        const targetLanguage = activeConfig?.targetLanguage;
-        if (!configuredSourceLanguage || !targetLanguage) {
+        const configuredTargetLanguage = activeConfig?.targetLanguage;
+        if (!configuredSourceLanguage || !configuredTargetLanguage) {
           continue;
         }
 
         const useDetected = env('USE_DETECTED_SOURCE_LANGUAGE', 'true').toLowerCase() === 'true';
-        const sourceLanguage = useDetected
-          ? toVachanaLanguageCode(item.detectedLanguage)
-          : configuredSourceLanguage;
-        const contextHint = getContextHint();
+
+        let sourceLanguage;
+        let targetLanguage;
+        let contextHint;
+
+        if (isIncoming) {
+          sourceLanguage = useDetected
+            ? toVachanaLanguageCode(item.detectedLanguage)
+            : toVachanaLanguageCode(configuredTargetLanguage);
+          targetLanguage = toVachanaLanguageCode(configuredSourceLanguage);
+          contextHint = getContextHintReverse();
+        } else {
+          sourceLanguage = useDetected
+            ? toVachanaLanguageCode(item.detectedLanguage)
+            : configuredSourceLanguage;
+          targetLanguage = configuredTargetLanguage;
+          contextHint = getContextHint();
+        }
 
         let translatedText = '';
         const translateStartMs = Date.now();
@@ -1142,12 +1336,16 @@ async function processTranscriptQueue() {
           }
         }
 
-        logInfo(`TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`);
+        logInfo(
+          isIncoming
+            ? `TRANSLATED-IN(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`
+            : `TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`
+        );
 
         if (sessionArtifacts) {
           appendLine(
             sessionArtifacts.translatedLogPath,
-            `[${nowISO()}] seg=${item.id} ${sourceLanguage}->${targetLanguage} :: ${translatedText}`
+            `[${nowISO()}] seg=${item.id} ${isIncoming ? '[in] ' : ''}${sourceLanguage}->${targetLanguage} :: ${translatedText}`
           );
         }
 
@@ -1157,6 +1355,7 @@ async function processTranscriptQueue() {
           target_language: targetLanguage,
           source_text: item.text,
           translated_text: translatedText,
+          direction: isIncoming ? 'incoming' : 'outgoing',
         });
 
         event.sender.send('transcript', {
@@ -1164,10 +1363,16 @@ async function processTranscriptQueue() {
           translated: true,
           sourceText: item.text,
           speakerId: item.speakerId || '',
+          incoming: isIncoming,
         });
 
-        appendContextText(recentSourceContext, item.text);
-        appendContextText(recentTargetContext, translatedText);
+        if (isIncoming) {
+          appendContextText(recentIncomingSourceContext, item.text);
+          appendContextText(recentIncomingTargetContext, translatedText);
+        } else {
+          appendContextText(recentSourceContext, item.text);
+          appendContextText(recentTargetContext, translatedText);
+        }
 
         enqueueTtsJob({
           segmentId: item.id,
@@ -1175,6 +1380,7 @@ async function processTranscriptQueue() {
           event,
           segmentStartMs,
           translateElapsedMs,
+          playbackChannel: isIncoming ? 'local' : 'meeting',
         });
       } catch (error) {
         logError(`SEGMENT ERROR seg=${item.id}: ${error.message}`);
@@ -1218,6 +1424,7 @@ async function processTtsJobQueue() {
       event,
       segmentStartMs,
       translateElapsedMs,
+      playbackChannel = 'meeting',
     } = job;
     const ttsQueueWaitMs = elapsedMs(segmentStartMs) - Number(translateElapsedMs || 0);
 
@@ -1249,6 +1456,7 @@ async function processTtsJobQueue() {
                 sampleRate,
                 numChannels: Number(env('VACHANA_TTS_NUM_CHANNELS', '1')),
                 sampleWidth: Number(env('VACHANA_TTS_SAMPLE_WIDTH', '2')),
+                channel: playbackChannel,
               });
             },
           });
@@ -1257,6 +1465,7 @@ async function processTtsJobQueue() {
             segmentId,
             chunkCount: stats.chunkCount,
             byteCount: stats.byteCount,
+            channel: playbackChannel,
           });
 
           writeEvent('segment_tts', {
@@ -1277,7 +1486,7 @@ async function processTtsJobQueue() {
           }
 
           logError(`TTS realtime failed; using REST fallback: ${wsError.message}`);
-          const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event);
+          const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel);
           writeEvent('segment_tts', {
             segment_id: segmentId,
             audio_bytes: audioBytes,
@@ -1291,7 +1500,7 @@ async function processTtsJobQueue() {
           );
         }
       } else {
-        const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event);
+        const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel);
         writeEvent('segment_tts', {
           segment_id: segmentId,
           audio_bytes: audioBytes,
@@ -1348,6 +1557,27 @@ function enqueueTranscript(event, msg) {
   lastTranscriptAt = Date.now();
 
   enqueueSpeechFragment(event, msg);
+}
+
+function enqueueTranscriptIncoming(event, msg) {
+  if (!msg || msg.type !== 'transcript' || !msg.text || !msg.text.trim()) {
+    return;
+  }
+
+  if (!isMeaningfulTranscript(msg.text)) {
+    return;
+  }
+
+  const normalized = normalizeTranscriptForDedupe(msg.text);
+  if (normalized && normalized === lastEnqueuedTranscriptNormIncoming) {
+    logInfo(`STT incoming duplicate skipped: "${String(msg.text).trim()}"`);
+    return;
+  }
+  lastEnqueuedTranscriptNormIncoming = normalized;
+
+  lastTranscriptAt = Date.now();
+
+  enqueueIncomingSpeechFragment(event, msg);
 }
 
 function connectSTT(event, sourceLanguage) {
@@ -1413,6 +1643,66 @@ function connectSTT(event, sourceLanguage) {
     sttSocket.on('close', () => {
       if (translationRunning) {
         sendStatus(event, false, 'STT disconnected. Click Start again.');
+      }
+    });
+  });
+}
+
+function connectSTTReturn(event, targetLanguage) {
+  return new Promise((resolve, reject) => {
+    const endpoint = env('VACHANA_STT_REALTIME_ENDPOINT', 'wss://api.vachana.ai/stt/v3/stream').trim();
+    const apiKey = env('VACHANA_API_KEY_ID').trim();
+    if (!apiKey) {
+      reject(new Error('VACHANA_API_KEY_ID missing in .env'));
+      return;
+    }
+
+    const langOverride = env('VACHANA_STT_RETURN_LANG_CODE', '').trim();
+    const langCode = langOverride || sttRealtimeLangCode(targetLanguage);
+    const includeLanguageHeader = env('VACHANA_STT_INCLUDE_LANGUAGE_HEADER', 'false').toLowerCase() === 'true';
+    const headers = {
+      'x-api-key-id': apiKey,
+      lang_code: langCode,
+    };
+
+    if (includeLanguageHeader) {
+      headers['x-language-code'] = langCode;
+    }
+
+    logInfo(`Connecting return STT websocket (team audio, ${langCode}) to ${endpoint}`);
+    sttSocketReturn = new WebSocket(endpoint, { headers });
+
+    sttSocketReturn.on('open', () => resolve());
+
+    sttSocketReturn.on('message', (payload, isBinary) => {
+      if (isBinary) {
+        return;
+      }
+
+      try {
+        const msg = JSON.parse(payload.toString());
+        if (msg.type === 'connected' || msg.type === 'processing') {
+          return;
+        }
+        if (msg.type === 'error') {
+          logError(`Return STT error: ${msg.message}`);
+          return;
+        }
+
+        enqueueTranscriptIncoming(event, msg);
+      } catch (error) {
+        logError(`Bad return STT message: ${error.message}`);
+      }
+    });
+
+    sttSocketReturn.on('error', (error) => {
+      logError(`RETURN STT SOCKET ERROR: ${error.message}`);
+      reject(error);
+    });
+
+    sttSocketReturn.on('close', () => {
+      if (translationRunning && activeConfig?.bidirectional) {
+        logError('Return STT disconnected (team-audio path).');
       }
     });
   });
@@ -1534,6 +1824,13 @@ function teardownPipeline() {
   lastTranscriptAt = 0;
   wsHealthFailoverTriggered = false;
   lastEnqueuedTranscriptNorm = '';
+  lastEnqueuedTranscriptNormIncoming = '';
+  speechAggregationBufferIncoming = [];
+  speechAggregationEventIncoming = null;
+  speechAggregationStartedAtIncoming = 0;
+  clearSpeechAggregationTimerIncoming();
+  recentIncomingSourceContext = [];
+  recentIncomingTargetContext = [];
 
   if (restFlushTimer) {
     clearInterval(restFlushTimer);
@@ -1555,12 +1852,20 @@ function teardownPipeline() {
     }
     sttSocket = null;
   }
+  if (sttSocketReturn) {
+    try {
+      sttSocketReturn.close();
+    } catch (_e) {
+      // no-op
+    }
+    sttSocketReturn = null;
+  }
 }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 420,
-    height: 560,
+    height: 640,
     resizable: false,
     title: 'Gnani Translator',
     webPreferences: {
@@ -1585,12 +1890,14 @@ ipcMain.on('start-translation', (event, config = {}) => {
   const preferredSpeakerId = config.preferredSpeakerId != null
     ? String(config.preferredSpeakerId).trim()
     : String(env('VACHANA_PREFERRED_SPEAKER_ID', '')).trim();
+  const bidirectionalRequested = Boolean(config.bidirectional);
 
   initSessionArtifacts(sourceLanguage, targetLanguage);
   writeEvent('session_start', {
     source_language: sourceLanguage,
     target_language: targetLanguage,
     speaker_preference_mode: speakerPreferenceMode,
+    bidirectional: bidirectionalRequested,
   });
 
   resetSpeakerPreferenceState();
@@ -1599,16 +1906,24 @@ ipcMain.on('start-translation', (event, config = {}) => {
     targetLanguage,
     speakerPreferenceMode,
     preferredSpeakerId,
+    bidirectional: bidirectionalRequested,
   };
   audioFramesForwarded = 0;
   audioFramesDropped = 0;
   segmentCounter = 0;
   lastEnqueuedTranscriptNorm = '';
+  lastEnqueuedTranscriptNormIncoming = '';
   lastTranscriptAt = Date.now();
   lastSpeechDetectedAt = 0;
   wsHealthFailoverTriggered = false;
   recentSourceContext = [];
   recentTargetContext = [];
+  recentIncomingSourceContext = [];
+  recentIncomingTargetContext = [];
+  speechAggregationBufferIncoming = [];
+  speechAggregationEventIncoming = null;
+  speechAggregationStartedAtIncoming = 0;
+  clearSpeechAggregationTimerIncoming();
 
   if (metricsTimer) {
     clearInterval(metricsTimer);
@@ -1621,10 +1936,20 @@ ipcMain.on('start-translation', (event, config = {}) => {
 
   const sttModePref = env('VACHANA_STT_MODE', 'ws').toLowerCase();
   if (sttModePref === 'rest') {
+    if (bidirectionalRequested) {
+      activeConfig.bidirectional = false;
+      logError('Bidirectional mode requires WebSocket STT; running outgoing path only (REST mode).');
+    }
     translationRunning = true;
     sttMode = 'rest';
     startRestSttFallback(event, sourceLanguage);
-    sendStatus(event, true, `Pipeline started in REST continuous mode (${sourceLanguage} -> ${targetLanguage}).`);
+    sendStatus(
+      event,
+      true,
+      bidirectionalRequested
+        ? `Pipeline started in REST mode (${sourceLanguage} -> ${targetLanguage}). Team listen path disabled — set VACHANA_STT_MODE=ws for bidirectional.`
+        : `Pipeline started in REST continuous mode (${sourceLanguage} -> ${targetLanguage}).`,
+    );
     return;
   }
 
@@ -1633,15 +1958,38 @@ ipcMain.on('start-translation', (event, config = {}) => {
       sttMode = 'ws';
       translationRunning = true;
       ensureSttHealthWatch();
-      sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}).`);
+      if (!activeConfig.bidirectional) {
+        sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}).`);
+        return Promise.resolve();
+      }
+      return connectSTTReturn(event, targetLanguage)
+        .then(() => {
+          sendStatus(
+            event,
+            true,
+            `Bidirectional: you → ${targetLanguage} (meeting); team → ${sourceLanguage} (headphones).`,
+          );
+        })
+        .catch((err) => {
+          activeConfig.bidirectional = false;
+          logError(`Return STT connect failed: ${err.message}`);
+          sendStatus(
+            event,
+            true,
+            `Pipeline started (${sourceLanguage} -> ${targetLanguage}). Team listen disabled: ${err.message}`,
+          );
+        });
     })
     .catch((error) => {
       const restFallback = env('ENABLE_STT_REST_FALLBACK', 'true').toLowerCase() === 'true';
       if (restFallback) {
         translationRunning = true;
+        if (activeConfig) {
+          activeConfig.bidirectional = false;
+        }
         startRestSttFallback(event, sourceLanguage);
         ensureSttHealthWatch();
-        sendStatus(event, true, `WS STT failed (${error.message}). REST fallback active.`);
+        sendStatus(event, true, `WS STT failed (${error.message}). REST fallback active (bidirectional disabled).`);
         return;
       }
 
@@ -1687,6 +2035,27 @@ ipcMain.on('audio-chunk', (_event, chunkBytes) => {
 
   sttSocket.send(buffer);
   audioFramesForwarded += 1;
+});
+
+ipcMain.on('audio-chunk-return', (_event, chunkBytes) => {
+  if (!translationRunning || !activeConfig?.bidirectional) {
+    return;
+  }
+
+  if (!chunkBytes) {
+    return;
+  }
+
+  const buffer = Buffer.isBuffer(chunkBytes) ? chunkBytes : Buffer.from(chunkBytes);
+  if (buffer.length !== 1024) {
+    return;
+  }
+
+  if (sttMode !== 'ws' || !sttSocketReturn || sttSocketReturn.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  sttSocketReturn.send(buffer);
 });
 
 ipcMain.on('mic-activity', (_event, payload = {}) => {

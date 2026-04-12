@@ -43,6 +43,19 @@
   <h3>Output Device (route to virtual cable):</h3>
   <select id="outputSelect"><option>Loading devices...</option></select>
 
+  <p style="font-size: 13px; margin: 8px 0 0 0; text-align: left; width: 80%; margin-left: auto; margin-right: auto;">
+    <label title="Requires a second capture of meeting/system audio (e.g. BlackHole 2ch) and headphones for local playback.">
+      <input type="checkbox" id="bidirectionalToggle">
+      Bidirectional — team hears your target language; you hear them in your source language
+    </label>
+  </p>
+  <div id="bidirectionalOpts" style="display: none;">
+    <h3>Meeting / system audio (loopback):</h3>
+    <select id="listenSelect"><option value="">-- Select loopback / mix input --</option></select>
+    <h3>Headphones / speakers (for translated team speech):</h3>
+    <select id="localOutputSelect"><option value="">-- Select physical output --</option></select>
+  </div>
+
   <h3>Source Language:</h3>
   <select id="sourceLang"></select>
 
@@ -72,7 +85,8 @@
     2. In this app, Input Microphone must be your physical mic (not CABLE Output).<br>
     3. In this app, Output Device should be CABLE Input/BlackHole.<br>
     4. Click Start Translation.<br>
-    5. In Teams/Meet settings, set Microphone to CABLE Output/BlackHole and keep Speaker on your headset.
+    5. In Teams/Meet settings, set Microphone to CABLE Output/BlackHole and keep Speaker on your headset.<br>
+    <strong>Bidirectional:</strong> add a loopback device (e.g. BlackHole 2ch) as &quot;Meeting audio&quot; so the app hears what others say in the call. Route team speech TTS to your headphones, not to the virtual cable, to avoid feedback.
   </p>
 
   <script src="renderer.js"></script>
