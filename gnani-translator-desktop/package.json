@@ -8,6 +8,9 @@
     "build": "electron-builder"
   },
   "dependencies": {
+    "@google-cloud/speech": "^6.7.1",
+    "@google-cloud/text-to-speech": "^5.8.1",
+    "@google-cloud/translate": "^8.5.1",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0"
   },
