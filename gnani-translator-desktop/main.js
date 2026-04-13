@@ -9,6 +9,44 @@ const dotenv = require('dotenv');
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
+// ---------- Google Cloud SDK clients (lazy-init on first use) ----------
+let _googleTranslateClient = null;
+let _googleTtsClient = null;
+let _googleSpeechClient = null;
+
+function resolveGoogleKeyFile() {
+  const raw = env('GOOGLE_APPLICATION_CREDENTIALS', 'ai-translation-app-493204-d9dc12f54709.json').trim();
+  if (path.isAbsolute(raw)) {
+    return raw;
+  }
+  // Resolve relative to repo root (one level above gnani-translator-desktop/).
+  return path.join(__dirname, '..', raw);
+}
+
+function getGoogleTranslateClient() {
+  if (!_googleTranslateClient) {
+    const { Translate } = require('@google-cloud/translate').v2;
+    _googleTranslateClient = new Translate({ keyFilename: resolveGoogleKeyFile() });
+  }
+  return _googleTranslateClient;
+}
+
+function getGoogleTtsClient() {
+  if (!_googleTtsClient) {
+    const textToSpeech = require('@google-cloud/text-to-speech');
+    _googleTtsClient = new textToSpeech.TextToSpeechClient({ keyFilename: resolveGoogleKeyFile() });
+  }
+  return _googleTtsClient;
+}
+
+function getGoogleSpeechClient() {
+  if (!_googleSpeechClient) {
+    const speech = require('@google-cloud/speech');
+    _googleSpeechClient = new speech.SpeechClient({ keyFilename: resolveGoogleKeyFile() });
+  }
+  return _googleSpeechClient;
+}
+
 let mainWindow;
 let translationRunning = false;
 let sttSocket = null;
@@ -25,6 +63,7 @@ let segmentCounter = 0;
 let transcriptQueue = [];
 let queueProcessing = false;
 let sessionArtifacts = null;
+let pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0 };
 let lastMicActivityLogTs = 0;
 let activeSender = null;
 let lastSpeechDetectedAt = 0;
@@ -82,6 +121,46 @@ function elapsedMs(startMs) {
   return Math.max(0, Date.now() - Number(startMs || Date.now()));
 }
 
+function padRight(str, len) {
+  const s = String(str);
+  return s.length >= len ? s : s + ' '.repeat(len - s.length);
+}
+
+function writePipelineRow({ segmentId, sttMs, translateMs, ttsMs, totalMs, sourceText, translatedText }) {
+  if (!sessionArtifacts) return;
+  const timeStr = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  const row =
+    padRight(segmentId, 5)
+    + padRight(timeStr, 14)
+    + padRight(sttMs, 9)
+    + padRight(translateMs, 14)
+    + padRight(ttsMs, 9)
+    + padRight(totalMs, 10)
+    + `${sourceText}  →  ${translatedText}\n`;
+  appendLine(sessionArtifacts.pipelineLogPath, row);
+
+  pipelineStats.count += 1;
+  pipelineStats.sttSum += Number(sttMs) || 0;
+  pipelineStats.translateSum += Number(translateMs) || 0;
+  pipelineStats.ttsSum += Number(ttsMs) || 0;
+  pipelineStats.totalSum += Number(totalMs) || 0;
+}
+
+function writePipelineSummary() {
+  if (!sessionArtifacts || pipelineStats.count === 0) return;
+  const n = pipelineStats.count;
+  const avg = (v) => Math.round(v / n);
+  const summary =
+    '\n' + '─'.repeat(120) + '\n'
+    + `Session ended : ${nowISO()}\n`
+    + `Total segments: ${n}\n`
+    + `Avg STT       : ${avg(pipelineStats.sttSum)} ms\n`
+    + `Avg Translate : ${avg(pipelineStats.translateSum)} ms\n`
+    + `Avg TTS       : ${avg(pipelineStats.ttsSum)} ms\n`
+    + `Avg Total     : ${avg(pipelineStats.totalSum)} ms\n`;
+  appendLine(sessionArtifacts.pipelineLogPath, summary);
+}
+
 function getWorkspaceRoot() {
   return path.join(__dirname, '..');
 }
@@ -109,6 +188,7 @@ function initSessionArtifacts(sourceLanguage, targetLanguage) {
     spokenTextPath: path.join(dir, 'spoken_text.txt'),
     translatedLogPath: path.join(dir, 'translated_transcript.log'),
     eventsPath: path.join(dir, 'events.jsonl'),
+    pipelineLogPath: path.join(dir, 'pipeline_timings.txt'),
     sourceLanguage,
     targetLanguage,
   };
@@ -117,6 +197,26 @@ function initSessionArtifacts(sourceLanguage, targetLanguage) {
   fs.writeFileSync(sessionArtifacts.spokenTextPath, '', 'utf8');
   fs.writeFileSync(sessionArtifacts.translatedLogPath, '', 'utf8');
   fs.writeFileSync(sessionArtifacts.eventsPath, '', 'utf8');
+
+  const pipelineHeader =
+    `=== Pipeline Timing Log ===\n`
+    + `Session started : ${nowISO()}\n`
+    + `Source language  : ${sourceLanguage}\n`
+    + `Target language  : ${targetLanguage}\n`
+    + `STT provider     : ${env('STT_PROVIDER', 'google')}\n`
+    + `Translate provider: ${env('TRANSLATION_PROVIDER', 'google')}\n`
+    + `TTS provider     : ${env('TTS_PROVIDER', 'google')}\n`
+    + `\n`
+    + padRight('#', 5)
+    + padRight('Time', 14)
+    + padRight('STT ms', 9)
+    + padRight('Translate ms', 14)
+    + padRight('TTS ms', 9)
+    + padRight('Total ms', 10)
+    + `Source Text  →  Translated Text\n`
+    + '─'.repeat(120) + '\n';
+  fs.writeFileSync(sessionArtifacts.pipelineLogPath, pipelineHeader, 'utf8');
+  pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0 };
 
   logInfo(`Session log directory: ${dir}`);
 }
@@ -439,6 +539,7 @@ function flushSpeechAggregationBuffer(force = false) {
   const receivedAt = speechAggregationBuffer[0].receivedAt || nowISO();
   const aggregatedCount = speechAggregationBuffer.length;
   const segmentSpeakerId = speechAggregationBuffer.map((x) => x.speakerId).find((s) => s && String(s).trim()) || '';
+  const sttElapsedMs = Math.max(...speechAggregationBuffer.map((x) => x.sttElapsedMs || 0));
 
   speechAggregationBuffer = [];
   clearSpeechAggregationTimer();
@@ -460,6 +561,7 @@ function flushSpeechAggregationBuffer(force = false) {
     receivedAt,
     aggregatedCount,
     createdAtMs: Date.now(),
+    sttElapsedMs,
   });
 
   logInfo(`QUEUE pushed aggregated segment=${segmentCounter} fragments=${aggregatedCount} pending=${transcriptQueue.length}`);
@@ -491,6 +593,7 @@ function enqueueSpeechFragment(event, msg) {
     detectedLanguage: msg.detected_language || activeConfig?.sourceLanguage || 'unknown',
     speakerId: extractSpeakerIdFromStt(msg),
     receivedAt: nowISO(),
+    sttElapsedMs: msg.sttElapsedMs || 0,
     event,
   });
 
@@ -584,6 +687,7 @@ function flushIncomingSpeechAggregationBuffer(force = false) {
   const receivedAt = speechAggregationBufferIncoming[0].receivedAt || nowISO();
   const aggregatedCount = speechAggregationBufferIncoming.length;
   const segmentSpeakerId = speechAggregationBufferIncoming.map((x) => x.speakerId).find((s) => s && String(s).trim()) || '';
+  const sttElapsedMs = Math.max(...speechAggregationBufferIncoming.map((x) => x.sttElapsedMs || 0));
 
   speechAggregationBufferIncoming = [];
   clearSpeechAggregationTimerIncoming();
@@ -606,6 +710,7 @@ function flushIncomingSpeechAggregationBuffer(force = false) {
     aggregatedCount,
     createdAtMs: Date.now(),
     direction: 'in',
+    sttElapsedMs,
   });
 
   logInfo(`QUEUE pushed incoming segment=${segmentCounter} fragments=${aggregatedCount} pending=${transcriptQueue.length}`);
@@ -637,6 +742,7 @@ function enqueueIncomingSpeechFragment(event, msg) {
     detectedLanguage: msg.detected_language || activeConfig?.targetLanguage || 'unknown',
     speakerId: extractSpeakerIdFromStt(msg),
     receivedAt: nowISO(),
+    sttElapsedMs: msg.sttElapsedMs || 0,
     event,
   });
 
@@ -762,6 +868,34 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 40000) {
   }
 }
 
+async function transcribeViaGoogle(pcmBytes, sourceLanguage) {
+  const startMs = Date.now();
+  const client = getGoogleSpeechClient();
+  const sampleRate = Number(env('VACHANA_STT_SAMPLE_RATE', '16000'));
+  const bcp47 = toBcp47(sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN'));
+  logInfo(`Google STT request languageCode=${bcp47} pcmBytes=${pcmBytes.length}`);
+
+  const [response] = await client.recognize({
+    audio: { content: pcmBytes.toString('base64') },
+    config: {
+      encoding: 'LINEAR16',
+      sampleRateHertz: sampleRate,
+      languageCode: bcp47,
+      enableAutomaticPunctuation: true,
+      model: 'latest_long',
+      useEnhanced: true,
+    },
+  });
+
+  const transcript = (response.results || [])
+    .map((r) => (r.alternatives && r.alternatives[0] ? r.alternatives[0].transcript : ''))
+    .join(' ')
+    .trim();
+
+  logInfo(`Google STT elapsed_ms=${elapsedMs(startMs)} transcript_len=${transcript.length}`);
+  return { transcript, speakerId: '' };
+}
+
 async function transcribeViaRest(pcmBytes, sourceLanguage) {
   const apiKey = env('VACHANA_API_KEY_ID');
   const endpoints = candidateEndpoints(
@@ -849,11 +983,35 @@ async function translateViaPublicFallback(text, sourceLanguage, targetLanguage) 
     .trim();
 }
 
+async function translateViaGoogle(text, sourceLanguage, targetLanguage) {
+  const startMs = Date.now();
+  const client = getGoogleTranslateClient();
+  const sl = normalizeLangCode(sourceLanguage);
+  const tl = normalizeLangCode(targetLanguage);
+  const [translation] = await client.translate(text, { from: sl, to: tl });
+  const result = Array.isArray(translation) ? translation[0] : translation;
+  logInfo(`Google Translate elapsed_ms=${elapsedMs(startMs)} len=${(result || '').length}`);
+  return String(result || '').trim();
+}
+
 async function translateText(text, sourceLanguage, targetLanguage, contextHint = { source: '', target: '' }) {
   if (!text || !text.trim()) {
     return '';
   }
 
+  const provider = env('TRANSLATION_PROVIDER', 'google').toLowerCase();
+
+  if (provider === 'google') {
+    try {
+      return await translateViaGoogle(text, sourceLanguage, targetLanguage);
+    } catch (err) {
+      logError(`Google Translate error: ${err.message}`);
+      logInfo('Google Translate failed. Trying public fallback.');
+      return translateViaPublicFallback(text, sourceLanguage, targetLanguage);
+    }
+  }
+
+  // ---------- Vachana (legacy) ----------
   const apiKey = env('VACHANA_API_KEY_ID');
   const endpoints = candidateEndpoints(
     env('VACHANA_TRANSLATE_ENDPOINTS', ''),
@@ -924,9 +1082,8 @@ async function translateText(text, sourceLanguage, targetLanguage, contextHint =
 }
 
 /**
- * Optional: Python REST TTS (same contract as synthesizeTTS below). Set VACHANA_TTS_USE_PYTHON=true.
- * Script lives in this app folder: gnani-translator-desktop/scripts/tts_once.py
- * Deps: pip install -r gnani-translator-desktop/scripts/requirements.txt
+ * Optional: Python REST TTS (legacy Vachana fallback). Set VACHANA_TTS_USE_PYTHON=true.
+ * Only used when TTS_PROVIDER=vachana.
  */
 function synthesizeTTSViaPythonSubprocess(text) {
   const repoRoot = path.join(__dirname, '..');
@@ -963,7 +1120,85 @@ function synthesizeTTSViaPythonSubprocess(text) {
   return Buffer.from(result.stdout);
 }
 
-async function synthesizeTTS(text) {
+/**
+ * Map a language code to a Google TTS voice name.
+ * Uses neural2 voices when available, falls back to standard.
+ * GOOGLE_TTS_VOICE_<LANG_TAG> env overrides per language (e.g. GOOGLE_TTS_VOICE_HI_IN=hi-IN-Wavenet-C).
+ */
+function googleTtsVoiceForLang(langCode) {
+  const override = env(`GOOGLE_TTS_VOICE_${String(langCode).toUpperCase().replace(/-/g, '_')}`, '').trim();
+  if (override) {
+    return override;
+  }
+  const lc = String(langCode).toLowerCase().split('-')[0];
+  const defaults = {
+    hi: 'hi-IN-Neural2-A',
+    en: 'en-IN-Neural2-A',
+    bn: 'bn-IN-Wavenet-A',
+    gu: 'gu-IN-Wavenet-A',
+    kn: 'kn-IN-Wavenet-A',
+    ml: 'ml-IN-Wavenet-A',
+    mr: 'mr-IN-Wavenet-A',
+    pa: 'pa-IN-Wavenet-A',
+    ta: 'ta-IN-Neural2-A',
+    te: 'te-IN-Standard-A',
+  };
+  return defaults[lc] || env('GOOGLE_TTS_VOICE', 'en-IN-Neural2-A');
+}
+
+/** Build a proper BCP-47 language code Google APIs accept (e.g. hi-IN, en-IN). */
+function toBcp47(langCode) {
+  const s = String(langCode || '').toLowerCase().trim();
+  if (s === 'en-hi-in-latn') {
+    return 'hi-IN';
+  }
+  if (s.includes('-in') || s.includes('-us') || s.includes('-gb')) {
+    const parts = s.split('-');
+    return `${parts[0]}-${parts[1].toUpperCase()}`;
+  }
+  const map = {
+    hi: 'hi-IN', en: 'en-IN', bn: 'bn-IN', gu: 'gu-IN',
+    kn: 'kn-IN', ml: 'ml-IN', mr: 'mr-IN', pa: 'pa-IN',
+    ta: 'ta-IN', te: 'te-IN',
+  };
+  return map[s] || s;
+}
+
+async function synthesizeTTSViaGoogle(text, langCode) {
+  const startMs = Date.now();
+  const client = getGoogleTtsClient();
+  const bcp47 = toBcp47(langCode);
+  const voiceName = googleTtsVoiceForLang(bcp47);
+  const sampleRate = Number(env('GOOGLE_TTS_SAMPLE_RATE', '24000'));
+
+  const [response] = await client.synthesizeSpeech({
+    input: { text },
+    voice: { languageCode: bcp47, name: voiceName },
+    audioConfig: {
+      audioEncoding: 'LINEAR16',
+      sampleRateHertz: sampleRate,
+    },
+  });
+
+  const buf = Buffer.from(response.audioContent);
+  logInfo(`Google TTS elapsed_ms=${elapsedMs(startMs)} bytes=${buf.length} voice=${voiceName}`);
+  return buf;
+}
+
+async function synthesizeTTS(text, langCode) {
+  const provider = env('TTS_PROVIDER', 'google').toLowerCase();
+
+  if (provider === 'google') {
+    const lang = langCode || activeConfig?.targetLanguage || env('VACHANA_DEFAULT_TARGET_LANGUAGE', 'hi-IN');
+    try {
+      return await synthesizeTTSViaGoogle(text, lang);
+    } catch (err) {
+      logError(`Google TTS error: ${err.message}. No fallback available.`);
+      throw err;
+    }
+  }
+
+  // ---------- Vachana (legacy) ----------
   if (env('VACHANA_TTS_USE_PYTHON', 'false').toLowerCase() === 'true') {
     return synthesizeTTSViaPythonSubprocess(text);
   }
@@ -1106,17 +1341,17 @@ function splitTextForSequentialTts(text) {
   return chunks.filter(Boolean);
 }
 
-async function synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel = 'meeting') {
+async function synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel = 'meeting', ttsLangCode = '') {
   const parts = splitTextForSequentialTts(translatedText);
   if (parts.length > 1) {
     logInfo(
-      `TTS sequential REST: ${parts.length} chunk(s), max_chars=${env('VACHANA_TTS_MAX_CHARS_PER_CHUNK', '120')} `
-      + '(next chunk requests while earlier audio is queued)',
+      `TTS sequential: ${parts.length} chunk(s), max_chars=${env('VACHANA_TTS_MAX_CHARS_PER_CHUNK', '120')} `
+      + '(chunks queued in order)',
     );
   }
   let totalBytes = 0;
   for (let i = 0; i < parts.length; i += 1) {
-    const audioBuffer = await synthesizeTTS(parts[i]);
+    const audioBuffer = await synthesizeTTS(parts[i], ttsLangCode);
     totalBytes += audioBuffer.length;
     event.sender.send('translated-audio', {
       mimeType: 'audio/wav',
@@ -1377,10 +1612,13 @@ async function processTranscriptQueue() {
         enqueueTtsJob({
           segmentId: item.id,
           translatedText,
+          sourceText: item.text,
           event,
           segmentStartMs,
+          sttElapsedMs: item.sttElapsedMs || 0,
           translateElapsedMs,
           playbackChannel: isIncoming ? 'local' : 'meeting',
+          ttsLangCode: targetLanguage,
         });
       } catch (error) {
         logError(`SEGMENT ERROR seg=${item.id}: ${error.message}`);
@@ -1421,17 +1659,20 @@ async function processTtsJobQueue() {
     const {
       segmentId,
       translatedText,
+      sourceText = '',
       event,
       segmentStartMs,
+      sttElapsedMs = 0,
       translateElapsedMs,
       playbackChannel = 'meeting',
+      ttsLangCode = '',
     } = job;
     const ttsQueueWaitMs = elapsedMs(segmentStartMs) - Number(translateElapsedMs || 0);
 
     try {
-      // Default false: REST returns full WAV per chunk (matches gnani-translator-desktop-py). WS streaming
-      // sends raw PCM fragments — renderer stitch + timing can sound worse; set ENABLE_TTS_REALTIME_WS=true for lower-latency stream.
-      const ttsRealtimeEnabled = env('ENABLE_TTS_REALTIME_WS', 'false').toLowerCase() === 'true';
+      const ttsProvider = env('TTS_PROVIDER', 'google').toLowerCase();
+      // WS streaming TTS only applies to Vachana; Google TTS is REST-only (still fast).
+      const ttsRealtimeEnabled = ttsProvider !== 'google' && env('ENABLE_TTS_REALTIME_WS', 'false').toLowerCase() === 'true';
       const ttsStartMs = Date.now();
       if (ttsRealtimeEnabled) {
         const ttsRealtimeEndpoint = env('VACHANA_TTS_REALTIME_ENDPOINT', 'wss://api.vachana.ai/api/v1/tts');
@@ -1479,6 +1720,11 @@ async function processTtsJobQueue() {
             + `translate_ms=${Number(translateElapsedMs || 0)} tts_queue_wait_ms=${Math.max(0, ttsQueueWaitMs)} `
             + `tts_ms=${elapsedMs(ttsStartMs)} mode=realtime-ws`
           );
+          writePipelineRow({
+            segmentId, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
+            ttsMs: elapsedMs(ttsStartMs), totalMs: elapsedMs(segmentStartMs),
+            sourceText, translatedText,
+          });
         } catch (wsError) {
           const restFallbackEnabled = env('ENABLE_TTS_REST_FALLBACK_ON_WS_ERROR', 'true').toLowerCase() === 'true';
           if (!restFallbackEnabled) {
@@ -1486,7 +1732,7 @@ async function processTtsJobQueue() {
           }
 
           logError(`TTS realtime failed; using REST fallback: ${wsError.message}`);
-          const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel);
+          const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel, ttsLangCode);
           writeEvent('segment_tts', {
             segment_id: segmentId,
             audio_bytes: audioBytes,
@@ -1498,19 +1744,30 @@ async function processTtsJobQueue() {
             + `translate_ms=${Number(translateElapsedMs || 0)} tts_queue_wait_ms=${Math.max(0, ttsQueueWaitMs)} `
             + `tts_ms=${elapsedMs(ttsStartMs)} mode=rest-fallback`
           );
+          writePipelineRow({
+            segmentId, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
+            ttsMs: elapsedMs(ttsStartMs), totalMs: elapsedMs(segmentStartMs),
+            sourceText, translatedText,
+          });
         }
       } else {
-        const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel);
+        const ttsMode = env('TTS_PROVIDER', 'google').toLowerCase() === 'google' ? 'google-tts' : 'rest';
+        const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel, ttsLangCode);
         writeEvent('segment_tts', {
           segment_id: segmentId,
           audio_bytes: audioBytes,
-          mode: 'rest',
+          mode: ttsMode,
         });
         logInfo(
           `LATENCY seg=${segmentId} total_ms=${elapsedMs(segmentStartMs)} `
           + `translate_ms=${Number(translateElapsedMs || 0)} tts_queue_wait_ms=${Math.max(0, ttsQueueWaitMs)} `
           + `tts_ms=${elapsedMs(ttsStartMs)} mode=rest`
         );
+        writePipelineRow({
+          segmentId, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
+          ttsMs: elapsedMs(ttsStartMs), totalMs: elapsedMs(segmentStartMs),
+          sourceText, translatedText,
+        });
       }
     } catch (error) {
       logError(`PIPELINE ERROR (tts): ${error.message}`);
@@ -1718,8 +1975,11 @@ function startRestSttFallback(event, sourceLanguage) {
     clearInterval(restFlushTimer);
   }
 
-  const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', '32000'));
-  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', '1500'));
+  const sttProvider = env('STT_PROVIDER', 'google').toLowerCase();
+  const defaultMinBytes = sttProvider === 'google' ? '48000' : '32000';
+  const defaultFlushMs = sttProvider === 'google' ? '2500' : '1500';
+  const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', defaultMinBytes));
+  const flushEveryMs = Number(env('VACHANA_STT_REST_FLUSH_MS', defaultFlushMs));
   const overlapMs = Number(env('VACHANA_STT_REST_OVERLAP_MS', '400'));
   const sampleRate = Number(env('VACHANA_STT_SAMPLE_RATE', '16000'));
   const overlapBytes = Math.max(0, Math.floor((overlapMs / 1000) * sampleRate * 2));
@@ -1747,20 +2007,25 @@ function startRestSttFallback(event, sourceLanguage) {
     restInFlight = true;
 
     try {
-      sendStatus(event, true, 'REST STT processing segment...');
-      const { transcript: text, speakerId } = await transcribeViaRest(chunk, sourceLanguage);
+      const sttProvider = env('STT_PROVIDER', 'google').toLowerCase();
+      sendStatus(event, true, `${sttProvider === 'google' ? 'Google' : 'REST'} STT processing...`);
+      const transcribeFn = sttProvider === 'google' ? transcribeViaGoogle : transcribeViaRest;
+      const sttStartMs = Date.now();
+      const { transcript: text, speakerId } = await transcribeFn(chunk, sourceLanguage);
+      const sttElapsedMs = elapsedMs(sttStartMs);
       if (text && text.trim()) {
         enqueueTranscript(event, {
           type: 'transcript',
           text,
           detected_language: sourceLanguage,
-          latency: 'rest',
+          latency: sttProvider === 'google' ? 'google-stt' : 'rest',
           speaker_id: speakerId || undefined,
+          sttElapsedMs,
         });
       }
     } catch (error) {
       logError(`STT REST ERROR: ${error.message}`);
-      sendStatus(event, true, `STT REST error: ${error.message}`);
+      sendStatus(event, true, `STT error: ${error.message}`);
     } finally {
       restInFlight = false;
     }
@@ -1818,7 +2083,9 @@ function teardownPipeline() {
   recentSourceContext = [];
   recentTargetContext = [];
   resetSpeakerPreferenceState();
+  writePipelineSummary();
   sessionArtifacts = null;
+  pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0 };
   activeSender = null;
   lastSpeechDetectedAt = 0;
   lastTranscriptAt = 0;

@@ -455,11 +455,12 @@ async function playTtsBlobScheduled(blob, channel) {
   if (nextStart < now) {
     nextStart = now;
   }
-  /** If segments arrived faster than realtime, avoid stacking huge silence. */
-  const catchUpSec = 0.55;
-  if (nextStart > now + catchUpSec) {
+
+  const maxQueueAheadSec = 30;
+  if (nextStart > now + maxQueueAheadSec) {
     nextStart = now;
   }
+
   const startAt = Math.max(now + TTS_SCHEDULE_LEAD_SEC, nextStart);
 
   const src = ctx.createBufferSource();
@@ -478,6 +479,11 @@ async function playTtsBlobScheduled(blob, channel) {
     ttsNextStartLocal = endAt;
   } else {
     ttsNextStartMeeting = endAt;
+  }
+
+  const waitSec = endAt - ctx.currentTime;
+  if (waitSec > 0) {
+    await new Promise((r) => setTimeout(r, waitSec * 1000));
   }
 }
 
