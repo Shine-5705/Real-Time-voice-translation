@@ -34,6 +34,13 @@ let selectedOutputSinkId = '';
 let selectedLocalOutputSinkId = '';
 const playbackQueue = [];
 let playbackActive = false;
+/** Gapless TTS: Web Audio scheduled playback (per output) instead of chained HTML Audio elements. */
+let ttsMeetingContext = null;
+let ttsLocalContext = null;
+let ttsNextStartMeeting = 0;
+let ttsNextStartLocal = 0;
+let ttsChainMeeting = Promise.resolve();
+let ttsChainLocal = Promise.resolve();
 let sttFrameQueue = [];
 let sttSendTimer = null;
 let returnSttFrameQueue = [];
@@ -43,7 +50,10 @@ let inputDeviceById = new Map();
 let outputDeviceById = new Map();
 const TARGET_SAMPLE_RATE = 16000;
 const PREAMP_GAIN = 1.35;
-const TTS_CHUNK_AGGREGATE_MS = 150;
+/** Lower = sooner first WS chunk plays; slightly higher = fewer tiny WAVs (smoother stream). */
+const TTS_CHUNK_AGGREGATE_MS = 90;
+const TTS_SCHEDULE_LEAD_SEC = 0.04;
+const TTS_CHUNK_FADE_IN_SEC = 0.004;
 const ENFORCE_TARGET_ONLY_AUDIO = true;
 const MIC_ECHO_CANCELLATION = true;
 const MIC_NOISE_SUPPRESSION = true;
@@ -346,6 +356,157 @@ function pcm16ChunkToWavBlob(base64Pcm, sampleRate = 16000, channels = 1, sample
   return new Blob([header, pcmBytes], { type: 'audio/wav' });
 }
 
+function teardownTtsPlayback() {
+  ttsChainMeeting = Promise.resolve();
+  ttsChainLocal = Promise.resolve();
+  ttsNextStartMeeting = 0;
+  ttsNextStartLocal = 0;
+  const stopCtx = (ctx) => {
+    if (!ctx) {
+      return;
+    }
+    if (ctx._ttsMediaEl) {
+      try {
+        ctx._ttsMediaEl.pause();
+        ctx._ttsMediaEl.srcObject = null;
+      } catch (_e) {
+        // no-op
+      }
+      ctx._ttsMediaEl = null;
+    }
+    ctx._ttsOutNode = null;
+    try {
+      ctx.close();
+    } catch (_e) {
+      // no-op
+    }
+  };
+  stopCtx(ttsMeetingContext);
+  stopCtx(ttsLocalContext);
+  ttsMeetingContext = null;
+  ttsLocalContext = null;
+}
+
+async function applySinkToTtsContext(ctx, sinkId) {
+  if (!sinkId || typeof ctx.setSinkId !== 'function') {
+    return;
+  }
+  try {
+    await ctx.setSinkId(sinkId);
+  } catch (err) {
+    console.warn('TTS AudioContext setSinkId:', err);
+  }
+}
+
+/**
+ * Route Web Audio to a specific output device. Prefer AudioContext.setSinkId when present;
+ * otherwise MediaStreamDestination + HTML Audio (setSinkId) so virtual cable still works.
+ */
+async function ensureTtsPlaybackDestination(ctx, sinkId) {
+  if (ctx._ttsOutNode) {
+    return ctx._ttsOutNode;
+  }
+  if (sinkId && typeof HTMLAudioElement !== 'undefined' && typeof HTMLAudioElement.prototype.setSinkId === 'function') {
+    const dest = ctx.createMediaStreamDestination();
+    const el = new Audio();
+    el.autoplay = true;
+    el.srcObject = dest.stream;
+    try {
+      await el.setSinkId(sinkId);
+      await el.play();
+    } catch (err) {
+      console.warn('TTS route via MediaStreamDestination:', err);
+    }
+    ctx._ttsMediaEl = el;
+    ctx._ttsOutNode = dest;
+    return dest;
+  }
+  if (sinkId) {
+    await applySinkToTtsContext(ctx, sinkId);
+  }
+  ctx._ttsOutNode = ctx.destination;
+  return ctx.destination;
+}
+
+async function playTtsBlobScheduled(blob, channel) {
+  const isLocal = channel === 'local';
+  const sinkId = isLocal ? selectedLocalOutputSinkId : selectedOutputSinkId;
+  let ctx = isLocal ? ttsLocalContext : ttsMeetingContext;
+  if (!ctx) {
+    ctx = new AudioContext();
+    if (isLocal) {
+      ttsLocalContext = ctx;
+    } else {
+      ttsMeetingContext = ctx;
+    }
+  }
+
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+
+  if (ctx.state === 'suspended') {
+    await ctx.resume();
+  }
+
+  const out = await ensureTtsPlaybackDestination(ctx, sinkId);
+
+  const now = ctx.currentTime;
+  let nextStart = isLocal ? ttsNextStartLocal : ttsNextStartMeeting;
+  if (nextStart < now) {
+    nextStart = now;
+  }
+  /** If segments arrived faster than realtime, avoid stacking huge silence. */
+  const catchUpSec = 0.55;
+  if (nextStart > now + catchUpSec) {
+    nextStart = now;
+  }
+  const startAt = Math.max(now + TTS_SCHEDULE_LEAD_SEC, nextStart);
+
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuffer;
+  const gain = ctx.createGain();
+  const endFade = Math.min(TTS_CHUNK_FADE_IN_SEC, audioBuffer.duration * 0.25);
+  gain.gain.setValueAtTime(0, startAt);
+  gain.gain.linearRampToValueAtTime(1, startAt + endFade);
+
+  src.connect(gain);
+  gain.connect(out);
+  src.start(startAt);
+
+  const endAt = startAt + audioBuffer.duration;
+  if (isLocal) {
+    ttsNextStartLocal = endAt;
+  } else {
+    ttsNextStartMeeting = endAt;
+  }
+}
+
+function enqueueScheduledTtsPlayback(blob, channel) {
+  const ch = channel || 'meeting';
+  const isLocal = ch === 'local';
+  if (isLocal) {
+    ttsChainLocal = ttsChainLocal
+      .then(() => playTtsBlobScheduled(blob, ch))
+      .catch((err) => {
+        console.warn('TTS schedule (local):', err);
+        fallbackPlayBlobUrl(blob, ch);
+      });
+    return;
+  }
+  ttsChainMeeting = ttsChainMeeting
+    .then(() => playTtsBlobScheduled(blob, ch))
+    .catch((err) => {
+      console.warn('TTS schedule (meeting):', err);
+      fallbackPlayBlobUrl(blob, ch);
+    });
+}
+
+function fallbackPlayBlobUrl(blob, channel) {
+  const url = URL.createObjectURL(blob);
+  playbackQueue.push({ url, channel: channel || 'meeting' });
+  playNextAudioInQueue();
+}
+
 async function playNextAudioInQueue() {
   if (playbackActive || playbackQueue.length === 0) {
     return;
@@ -420,10 +581,8 @@ function flushAggregatedTtsChunks(force = false) {
     ttsChunkMeta.numChannels,
     ttsChunkMeta.sampleWidth
   );
-  const url = URL.createObjectURL(blob);
   const ch = ttsChunkMeta.channel || 'meeting';
-  playbackQueue.push({ url, channel: ch });
-  playNextAudioInQueue();
+  enqueueScheduledTtsPlayback(blob, ch);
 }
 
 function isVirtualLabel(label) {
@@ -432,6 +591,7 @@ function isVirtualLabel(label) {
 
 function teardownAudioGraph() {
   teardownListenGraph();
+  teardownTtsPlayback();
   stopPacedSttSender();
   stopTtsAggregateTimer();
   ttsChunkBytesQueue = [];
@@ -864,10 +1024,8 @@ window.electronAPI.onTranscript((payload) => {
 
 window.electronAPI.onTranslatedAudio((payload) => {
   const blob = base64ToBlob(payload.audioBase64, payload.mimeType);
-  const url = URL.createObjectURL(blob);
   const channel = payload.channel || 'meeting';
-  playbackQueue.push({ url, channel });
-  playNextAudioInQueue();
+  enqueueScheduledTtsPlayback(blob, channel);
 });
 
 window.electronAPI.onTranslatedAudioChunk((payload) => {
