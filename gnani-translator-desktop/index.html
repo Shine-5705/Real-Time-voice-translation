@@ -43,11 +43,20 @@
   <h3>Output Device (route to virtual cable):</h3>
   <select id="outputSelect"><option>Loading devices...</option></select>
 
-  <!-- Bidirectional UI hidden — one-way mode only (you → target language → meeting). -->
-  <div id="bidirectionalOpts" style="display: none;">
-    <input type="checkbox" id="bidirectionalToggle">
-    <select id="listenSelect"><option value="">--</option></select>
-    <select id="localOutputSelect"><option value="">--</option></select>
+  <div style="width: 80%; margin: 10px auto; text-align: left;">
+    <label style="font-size: 14px; cursor: pointer;">
+      <input type="checkbox" id="bidirectionalToggle">
+      Enable Bidirectional (hear the other person in your language)
+    </label>
+    <div id="bidirectionalOpts" style="display: none; margin-top: 8px;">
+      <label style="font-size: 13px;">Loopback Input (meeting audio — e.g. BlackHole 2ch):</label>
+      <select id="listenSelect" style="width: 100%; margin: 4px 0;"><option value="">-- Select loopback device --</option></select>
+      <label style="font-size: 13px;">Your Headphones/Speakers (for hearing translations):</label>
+      <select id="localOutputSelect" style="width: 100%; margin: 4px 0;"><option value="">-- Select headphones --</option></select>
+      <p style="font-size: 11px; color: #888; margin: 4px 0 0 0;">
+        Loopback = the device Teams sends audio to (a 2nd virtual cable). Your headphones = where you hear the other person's translated speech.
+      </p>
+    </div>
   </div>
 
   <h3>Source Language:</h3>
