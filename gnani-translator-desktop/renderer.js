@@ -12,6 +12,8 @@ const bidirectionalToggle = document.getElementById('bidirectionalToggle');
 const bidirectionalOpts = document.getElementById('bidirectionalOpts');
 const listenSelect = document.getElementById('listenSelect');
 const localOutputSelect = document.getElementById('localOutputSelect');
+const enrollVoiceBtn = document.getElementById('enrollVoiceBtn');
+const enrollStatus = document.getElementById('enrollStatus');
 
 let inputStream = null;
 let returnInputStream = null;
@@ -1053,6 +1055,14 @@ window.electronAPI.onTranslatedAudioDone((payload) => {
   flushAggregatedTtsChunks(true);
 });
 
+window.electronAPI.onEnrollStatus((payload) => {
+  if (payload.enrolled && enrollStatus) {
+    enrollStatus.textContent = 'Voice enrolled! TTS will use your cloned voice.';
+    enrollStatus.style.color = '#28a745';
+    if (enrollVoiceBtn) enrollVoiceBtn.textContent = 'Re-enroll Voice';
+  }
+});
+
 window.addEventListener('beforeunload', () => {
   teardownAudioGraph();
 });
@@ -1071,3 +1081,133 @@ if (bidirectionalToggle && bidirectionalOpts) {
 
 buildLanguageOptions();
 loadDevices();
+
+// ── Voice Enrollment ──
+const ENROLL_DURATION_SEC = 10;
+let enrollRecording = false;
+
+function encodeWav(samples, sampleRate) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = samples.length * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  function writeString(offset, str) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+  return buffer;
+}
+
+if (enrollVoiceBtn) {
+  enrollVoiceBtn.addEventListener('click', async () => {
+    if (enrollRecording) return;
+
+    const deviceId = micSelect.value;
+    if (!deviceId) {
+      enrollStatus.textContent = 'Select a microphone first.';
+      return;
+    }
+
+    enrollRecording = true;
+    enrollVoiceBtn.disabled = true;
+    enrollVoiceBtn.textContent = 'Recording...';
+    enrollStatus.textContent = `Speak naturally for ${ENROLL_DURATION_SEC} seconds...`;
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { deviceId: { exact: deviceId }, sampleRate: 16000, channelCount: 1 },
+      });
+    } catch (err) {
+      enrollStatus.textContent = `Mic error: ${err.message}`;
+      enrollVoiceBtn.disabled = false;
+      enrollVoiceBtn.textContent = 'Enroll My Voice';
+      enrollRecording = false;
+      return;
+    }
+
+    const ctx = new AudioContext({ sampleRate: 16000 });
+    const source = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    const chunks = [];
+
+    processor.onaudioprocess = (e) => {
+      chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+    source.connect(processor);
+    processor.connect(ctx.destination);
+
+    let remaining = ENROLL_DURATION_SEC;
+    const countdownInterval = setInterval(() => {
+      remaining -= 1;
+      if (remaining > 0) {
+        enrollStatus.textContent = `Recording... ${remaining}s left`;
+      }
+    }, 1000);
+
+    await new Promise((r) => setTimeout(r, ENROLL_DURATION_SEC * 1000));
+
+    clearInterval(countdownInterval);
+    processor.disconnect();
+    source.disconnect();
+    stream.getTracks().forEach((t) => t.stop());
+    ctx.close();
+
+    enrollStatus.textContent = 'Processing recording...';
+
+    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+    const merged = new Float32Array(totalLen);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+
+    const wavBuffer = encodeWav(merged, 16000);
+    const wavBase64 = btoa(
+      new Uint8Array(wavBuffer).reduce((data, byte) => data + String.fromCharCode(byte), ''),
+    );
+
+    enrollStatus.textContent = 'Uploading to extract voice embedding...';
+
+    try {
+      const result = await window.electronAPI.enrollVoice(wavBase64);
+      if (result.success) {
+        enrollStatus.textContent = 'Voice enrolled! TTS will use your cloned voice.';
+        enrollStatus.style.color = '#28a745';
+        enrollVoiceBtn.textContent = 'Re-enroll Voice';
+      } else {
+        enrollStatus.textContent = `Enrollment failed: ${result.error}`;
+        enrollStatus.style.color = '#dc3545';
+        enrollVoiceBtn.textContent = 'Enroll My Voice';
+      }
+    } catch (err) {
+      enrollStatus.textContent = `Enrollment error: ${err.message}`;
+      enrollStatus.style.color = '#dc3545';
+      enrollVoiceBtn.textContent = 'Enroll My Voice';
+    }
+
+    enrollVoiceBtn.disabled = false;
+    enrollRecording = false;
+  });
+}
