@@ -56,6 +56,10 @@ let sttMode = 'ws';
 let restAudioBuffer = [];
 let restFlushTimer = null;
 let restInFlight = false;
+let restAudioBufferReturn = [];
+let restFlushTimerReturn = null;
+let restInFlightReturn = false;
+let restOverlapBufferReturn = Buffer.alloc(0);
 let audioFramesForwarded = 0;
 let audioFramesDropped = 0;
 let metricsTimer = null;
@@ -63,7 +67,7 @@ let segmentCounter = 0;
 let transcriptQueue = [];
 let queueProcessing = false;
 let sessionArtifacts = null;
-let pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0 };
+let pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0, latencySum: 0 };
 let lastMicActivityLogTs = 0;
 let activeSender = null;
 let lastSpeechDetectedAt = 0;
@@ -127,17 +131,23 @@ function padRight(str, len) {
   return s.length >= len ? s : s + ' '.repeat(len - s.length);
 }
 
-function writePipelineRow({ segmentId, sttMs, translateMs, ttsMs, totalMs, sourceText, translatedText }) {
+function fmtTime(ms) {
+  return new Date(ms).toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
+}
+
+function writePipelineRow({ segmentId, spokeAtMs, sttMs, translateMs, ttsMs, totalMs, sourceText, translatedText }) {
   if (!sessionArtifacts) return;
-  const timeStr = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  const playedAtMs = Date.now();
+  const spokeTime = fmtTime(spokeAtMs);
+  const playedTime = fmtTime(playedAtMs);
+  const latencyMs = playedAtMs - spokeAtMs;
+
   const row =
-    padRight(segmentId, 5)
-    + padRight(timeStr, 14)
-    + padRight(sttMs, 9)
-    + padRight(translateMs, 14)
-    + padRight(ttsMs, 9)
-    + padRight(totalMs, 10)
-    + `${sourceText}  →  ${translatedText}\n`;
+    `#${segmentId}\n`
+    + `  Spoke at    : ${spokeTime}  →  "${sourceText}"\n`
+    + `  Played at   : ${playedTime}  →  "${translatedText}"\n`
+    + `  Latency     : ${latencyMs} ms  (STT ${sttMs}ms + Translate ${translateMs}ms + TTS ${ttsMs}ms)\n`
+    + `\n`;
   appendLine(sessionArtifacts.pipelineLogPath, row);
 
   pipelineStats.count += 1;
@@ -145,6 +155,7 @@ function writePipelineRow({ segmentId, sttMs, translateMs, ttsMs, totalMs, sourc
   pipelineStats.translateSum += Number(translateMs) || 0;
   pipelineStats.ttsSum += Number(ttsMs) || 0;
   pipelineStats.totalSum += Number(totalMs) || 0;
+  pipelineStats.latencySum = (pipelineStats.latencySum || 0) + latencyMs;
 }
 
 function writePipelineSummary() {
@@ -152,13 +163,13 @@ function writePipelineSummary() {
   const n = pipelineStats.count;
   const avg = (v) => Math.round(v / n);
   const summary =
-    '\n' + '─'.repeat(120) + '\n'
-    + `Session ended : ${nowISO()}\n`
-    + `Total segments: ${n}\n`
-    + `Avg STT       : ${avg(pipelineStats.sttSum)} ms\n`
-    + `Avg Translate : ${avg(pipelineStats.translateSum)} ms\n`
-    + `Avg TTS       : ${avg(pipelineStats.ttsSum)} ms\n`
-    + `Avg Total     : ${avg(pipelineStats.totalSum)} ms\n`;
+    '\n' + '─'.repeat(80) + '\n'
+    + `Session ended       : ${nowISO()}\n`
+    + `Total segments      : ${n}\n`
+    + `Avg Spoke→Played    : ${avg(pipelineStats.latencySum || 0)} ms\n`
+    + `  Avg STT           : ${avg(pipelineStats.sttSum)} ms\n`
+    + `  Avg Translate     : ${avg(pipelineStats.translateSum)} ms\n`
+    + `  Avg TTS           : ${avg(pipelineStats.ttsSum)} ms\n`;
   appendLine(sessionArtifacts.pipelineLogPath, summary);
 }
 
@@ -208,16 +219,9 @@ function initSessionArtifacts(sourceLanguage, targetLanguage) {
     + `Translate provider: ${env('TRANSLATION_PROVIDER', 'google')}\n`
     + `TTS provider     : ${env('TTS_PROVIDER', 'google')}\n`
     + `\n`
-    + padRight('#', 5)
-    + padRight('Time', 14)
-    + padRight('STT ms', 9)
-    + padRight('Translate ms', 14)
-    + padRight('TTS ms', 9)
-    + padRight('Total ms', 10)
-    + `Source Text  →  Translated Text\n`
-    + '─'.repeat(120) + '\n';
+    + '─'.repeat(80) + '\n';
   fs.writeFileSync(sessionArtifacts.pipelineLogPath, pipelineHeader, 'utf8');
-  pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0 };
+  pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0, latencySum: 0 };
 
   logInfo(`Session log directory: ${dir}`);
 }
@@ -1786,7 +1790,7 @@ async function processTtsJobQueue() {
             + `tts_ms=${elapsedMs(ttsStartMs)} mode=realtime-ws`
           );
           writePipelineRow({
-            segmentId, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
+            segmentId, spokeAtMs: segmentStartMs, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
             ttsMs: elapsedMs(ttsStartMs), totalMs: elapsedMs(segmentStartMs),
             sourceText, translatedText,
           });
@@ -1810,7 +1814,7 @@ async function processTtsJobQueue() {
             + `tts_ms=${elapsedMs(ttsStartMs)} mode=rest-fallback`
           );
           writePipelineRow({
-            segmentId, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
+            segmentId, spokeAtMs: segmentStartMs, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
             ttsMs: elapsedMs(ttsStartMs), totalMs: elapsedMs(segmentStartMs),
             sourceText, translatedText,
           });
@@ -1829,7 +1833,7 @@ async function processTtsJobQueue() {
           + `tts_ms=${elapsedMs(ttsStartMs)} mode=rest`
         );
         writePipelineRow({
-          segmentId, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
+          segmentId, spokeAtMs: segmentStartMs, sttMs: sttElapsedMs, translateMs: translateElapsedMs,
           ttsMs: elapsedMs(ttsStartMs), totalMs: elapsedMs(segmentStartMs),
           sourceText, translatedText,
         });
@@ -2100,6 +2104,70 @@ function startRestSttFallback(event, sourceLanguage) {
   sendStatus(event, true, 'Realtime STT unavailable. Using REST STT fallback.');
 }
 
+function startRestSttReturnPath(event, targetLanguage) {
+  restAudioBufferReturn = [];
+  restInFlightReturn = false;
+  restOverlapBufferReturn = Buffer.alloc(0);
+
+  if (restFlushTimerReturn) {
+    clearInterval(restFlushTimerReturn);
+  }
+
+  const sttProvider = env('STT_PROVIDER', 'google').toLowerCase();
+  const minBytesPerFlush = Number(env('STT_RETURN_MIN_BYTES', '32000'));
+  const flushEveryMs = Number(env('STT_RETURN_FLUSH_MS', '2000'));
+  const overlapMs = Number(env('VACHANA_STT_REST_OVERLAP_MS', '400'));
+  const sampleRate = Number(env('VACHANA_STT_SAMPLE_RATE', '16000'));
+  const overlapBytes = Math.max(0, Math.floor((overlapMs / 1000) * sampleRate * 2));
+
+  restFlushTimerReturn = setInterval(async () => {
+    if (!translationRunning || !activeConfig?.bidirectional || restInFlightReturn) {
+      return;
+    }
+
+    const totalBytes = restAudioBufferReturn.reduce((sum, b) => sum + b.length, 0);
+    if (totalBytes < minBytesPerFlush) {
+      return;
+    }
+
+    const freshChunk = Buffer.concat(restAudioBufferReturn);
+    const chunk = restOverlapBufferReturn.length > 0
+      ? Buffer.concat([restOverlapBufferReturn, freshChunk])
+      : freshChunk;
+    restAudioBufferReturn = [];
+    if (overlapBytes > 0 && chunk.length > overlapBytes) {
+      restOverlapBufferReturn = chunk.subarray(chunk.length - overlapBytes);
+    } else {
+      restOverlapBufferReturn = chunk;
+    }
+    restInFlightReturn = true;
+
+    try {
+      logInfo(`RETURN STT flush bytes=${chunk.length} lang=${targetLanguage}`);
+      const transcribeFn = sttProvider === 'google' ? transcribeViaGoogle : transcribeViaRest;
+      const sttStartMs = Date.now();
+      const { transcript: text, speakerId } = await transcribeFn(chunk, targetLanguage);
+      const sttElapsedMs = elapsedMs(sttStartMs);
+      if (text && text.trim()) {
+        enqueueTranscriptIncoming(event, {
+          type: 'transcript',
+          text,
+          detected_language: targetLanguage,
+          latency: sttProvider === 'google' ? 'google-stt-return' : 'rest-return',
+          speaker_id: speakerId || undefined,
+          sttElapsedMs,
+        });
+      }
+    } catch (error) {
+      logError(`STT RETURN REST ERROR: ${error.message}`);
+    } finally {
+      restInFlightReturn = false;
+    }
+  }, flushEveryMs);
+
+  logInfo(`Return STT REST path started (${targetLanguage}) provider=${sttProvider}`);
+}
+
 function ensureSttHealthWatch() {
   if (sttHealthTimer) {
     clearInterval(sttHealthTimer);
@@ -2150,7 +2218,7 @@ function teardownPipeline() {
   resetSpeakerPreferenceState();
   writePipelineSummary();
   sessionArtifacts = null;
-  pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0 };
+  pipelineStats = { count: 0, sttSum: 0, translateSum: 0, ttsSum: 0, totalSum: 0, latencySum: 0 };
   activeSender = null;
   lastSpeechDetectedAt = 0;
   lastTranscriptAt = 0;
@@ -2168,6 +2236,13 @@ function teardownPipeline() {
     clearInterval(restFlushTimer);
     restFlushTimer = null;
   }
+  if (restFlushTimerReturn) {
+    clearInterval(restFlushTimerReturn);
+    restFlushTimerReturn = null;
+  }
+  restAudioBufferReturn = [];
+  restInFlightReturn = false;
+  restOverlapBufferReturn = Buffer.alloc(0);
   if (metricsTimer) {
     clearInterval(metricsTimer);
     metricsTimer = null;
@@ -2196,8 +2271,8 @@ function teardownPipeline() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 420,
-    height: 720,
+    width: 440,
+    height: 800,
     resizable: false,
     title: 'Gnani Translator',
     webPreferences: {
@@ -2277,20 +2352,23 @@ ipcMain.on('start-translation', (event, config = {}) => {
 
   const sttModePref = env('VACHANA_STT_MODE', 'ws').toLowerCase();
   if (sttModePref === 'rest') {
-    if (bidirectionalRequested) {
-      activeConfig.bidirectional = false;
-      logError('Bidirectional mode requires WebSocket STT; running outgoing path only (REST mode).');
-    }
     translationRunning = true;
     sttMode = 'rest';
     startRestSttFallback(event, sourceLanguage);
-    sendStatus(
-      event,
-      true,
-      bidirectionalRequested
-        ? `Pipeline started in REST mode (${sourceLanguage} -> ${targetLanguage}). Team listen path disabled — set VACHANA_STT_MODE=ws for bidirectional.`
-        : `Pipeline started in REST continuous mode (${sourceLanguage} -> ${targetLanguage}).`,
-    );
+    if (bidirectionalRequested) {
+      startRestSttReturnPath(event, targetLanguage);
+      sendStatus(
+        event,
+        true,
+        `Bidirectional REST mode: you (${sourceLanguage}) → meeting; team (${targetLanguage}) → headphones.`,
+      );
+    } else {
+      sendStatus(
+        event,
+        true,
+        `Pipeline started in REST continuous mode (${sourceLanguage} -> ${targetLanguage}).`,
+      );
+    }
     return;
   }
 
@@ -2392,7 +2470,12 @@ ipcMain.on('audio-chunk-return', (_event, chunkBytes) => {
     return;
   }
 
-  if (sttMode !== 'ws' || !sttSocketReturn || sttSocketReturn.readyState !== WebSocket.OPEN) {
+  if (sttMode === 'rest') {
+    restAudioBufferReturn.push(buffer);
+    return;
+  }
+
+  if (!sttSocketReturn || sttSocketReturn.readyState !== WebSocket.OPEN) {
     return;
   }
 

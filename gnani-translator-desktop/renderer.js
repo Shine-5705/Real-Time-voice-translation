@@ -48,6 +48,9 @@ let sttSendTimer = null;
 let returnSttFrameQueue = [];
 let returnSttSendTimer = null;
 let lastMicTelemetryTs = 0;
+let meetingTtsGateUntil = 0;
+let localTtsGateUntil = 0;
+let micSpeakingUntil = 0;
 let inputDeviceById = new Map();
 let outputDeviceById = new Map();
 const TARGET_SAMPLE_RATE = 16000;
@@ -479,8 +482,12 @@ async function playTtsBlobScheduled(blob, channel) {
   const endAt = startAt + audioBuffer.duration;
   if (isLocal) {
     ttsNextStartLocal = endAt;
+    const localGateBufferMs = 500;
+    localTtsGateUntil = Date.now() + (audioBuffer.duration * 1000) + localGateBufferMs;
   } else {
     ttsNextStartMeeting = endAt;
+    const gateBufferMs = 300;
+    meetingTtsGateUntil = Date.now() + (audioBuffer.duration * 1000) + gateBufferMs;
   }
 
   const waitSec = endAt - ctx.currentTime;
@@ -744,12 +751,32 @@ async function startListenPipeline(listenDeviceId) {
   returnSilentGainNode = returnAudioContext.createGain();
   returnSilentGainNode.gain.value = 0;
 
+  let returnGatedFrames = 0;
+  let returnPassedFrames = 0;
+  let returnLogTs = 0;
+
   returnProcessorNode.onaudioprocess = (e) => {
+    const now = Date.now();
+    const ttsGated = now < meetingTtsGateUntil;
+    const micGated = now < micSpeakingUntil;
+
+    if (now - returnLogTs > 5000) {
+      returnLogTs = now;
+      console.log(`[return-capture] passed=${returnPassedFrames} gated=${returnGatedFrames} ttsGate=${ttsGated} micGate=${micGated}`);
+      returnGatedFrames = 0;
+      returnPassedFrames = 0;
+    }
+
+    if (ttsGated || micGated) {
+      returnGatedFrames += 1;
+      return;
+    }
+
+    returnPassedFrames += 1;
     const inputRate = e.inputBuffer.sampleRate || returnAudioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
-    const gated = applySoftNoiseGate(resampled);
-    const boosted = applyGain(gated, PREAMP_GAIN);
+    const boosted = applyGain(resampled, 2.0);
     sendPCMToSTTReturn(toInt16(boosted));
   };
 
@@ -802,7 +829,26 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
   silentGainNode = audioContext.createGain();
   silentGainNode.gain.value = 0;
 
+  let fwdGatedFrames = 0;
+  let fwdPassedFrames = 0;
+  let fwdLogTs = 0;
+
   processorNode.onaudioprocess = (e) => {
+    const now = Date.now();
+
+    if (now - fwdLogTs > 5000 && fwdGatedFrames > 0) {
+      fwdLogTs = now;
+      console.log(`[fwd-mic] passed=${fwdPassedFrames} gated=${fwdGatedFrames} (localTtsGate active)`);
+      fwdGatedFrames = 0;
+      fwdPassedFrames = 0;
+    }
+
+    if (now < localTtsGateUntil) {
+      fwdGatedFrames += 1;
+      return;
+    }
+    fwdPassedFrames += 1;
+
     const inputRate = e.inputBuffer.sampleRate || audioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
@@ -810,6 +856,12 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
     const gated = applySoftNoiseGate(adaptive);
     const boosted = applyGain(gated, PREAMP_GAIN);
     emitMicTelemetry(boosted);
+
+    const rms = computeRms(boosted);
+    if (rms > 0.02) {
+      micSpeakingUntil = Date.now() + 600;
+    }
+
     sendPCMToSTT(toInt16(boosted));
   };
 
