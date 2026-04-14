@@ -21,4 +21,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTranslatedAudioDone: (callback) => {
     ipcRenderer.on('translated-audio-done', (_event, payload) => callback(payload));
   },
+  enrollVoice: (wavBase64) => ipcRenderer.invoke('enroll-voice', wavBase64),
+  onEnrollStatus: (callback) => {
+    ipcRenderer.on('enroll-status', (_event, payload) => callback(payload));
+  },
 });

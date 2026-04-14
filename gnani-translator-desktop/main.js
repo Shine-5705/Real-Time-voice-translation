@@ -90,6 +90,7 @@ let speechAggregationBufferIncoming = [];
 let speechAggregationTimerIncoming = null;
 let speechAggregationStartedAtIncoming = 0;
 let speechAggregationEventIncoming = null;
+let voiceCloneEmbedding = null;
 
 function nowISO() {
   return new Date().toISOString();
@@ -1185,7 +1186,71 @@ async function synthesizeTTSViaGoogle(text, langCode) {
   return buf;
 }
 
+async function synthesizeTTSVoiceClone(text) {
+  const startMs = Date.now();
+  const apiKey = env('VACHANA_API_KEY_ID');
+  const sampleRate = Number(env('VACHANA_TTS_SAMPLE_RATE', '16000'));
+  const model = env('VACHANA_TTS_VOICE_CLONE_MODEL', 'vachana-vc-v1');
+  const container = env('VACHANA_TTS_CONTAINER', 'wav');
+
+  const endpoint = env('VACHANA_TTS_ENDPOINT', '/api/v1/tts/inference');
+  const url = buildUrl(endpoint);
+
+  logInfo(`Voice-clone TTS request endpoint=${url} model=${model} text_len=${text.length}`);
+
+  const resp = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key-ID': apiKey,
+    },
+    body: JSON.stringify({
+      text,
+      model,
+      audio_config: {
+        sample_rate: sampleRate,
+        encoding: 'linear_pcm',
+        container,
+        num_channels: 1,
+        sample_width: 2,
+      },
+      speaker_embedding: voiceCloneEmbedding,
+    }),
+  }, Number(env('VACHANA_TTS_REST_TIMEOUT_MS', '120000')));
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Voice-clone TTS failed: status=${resp.status} body=${body.slice(0, 300)}`);
+  }
+
+  const arr = await resp.arrayBuffer();
+  const buf = Buffer.from(arr);
+  logInfo(`Voice-clone TTS done elapsed_ms=${elapsedMs(startMs)} bytes=${buf.length}`);
+  return buf;
+}
+
+function loadSavedVoiceEmbedding() {
+  try {
+    const p = path.join(getWorkspaceRoot(), 'workdir', 'voice_embedding.json');
+    if (fs.existsSync(p)) {
+      voiceCloneEmbedding = JSON.parse(fs.readFileSync(p, 'utf8'));
+      logInfo(`Loaded saved voice embedding from ${p} shape=${JSON.stringify(voiceCloneEmbedding.shape)}`);
+    }
+  } catch (err) {
+    logError(`Failed loading saved voice embedding: ${err.message}`);
+  }
+}
+
 async function synthesizeTTS(text, langCode) {
+  const vcEnabled = env('VOICE_CLONE_ENABLED', 'false').toLowerCase() === 'true';
+  if (vcEnabled && voiceCloneEmbedding) {
+    try {
+      return await synthesizeTTSVoiceClone(text);
+    } catch (err) {
+      logError(`Voice-clone TTS error: ${err.message}. Falling back to default TTS.`);
+    }
+  }
+
   const provider = env('TTS_PROVIDER', 'google').toLowerCase();
 
   if (provider === 'google') {
@@ -2132,7 +2197,7 @@ function teardownPipeline() {
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 420,
-    height: 640,
+    height: 720,
     resizable: false,
     title: 'Gnani Translator',
     webPreferences: {
@@ -2143,9 +2208,18 @@ function createWindow() {
   });
 
   mainWindow.loadFile('index.html');
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (voiceCloneEmbedding) {
+      mainWindow.webContents.send('enroll-status', { enrolled: true });
+    }
+  });
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  loadSavedVoiceEmbedding();
+  createWindow();
+});
 
 ipcMain.on('start-translation', (event, config = {}) => {
   activeSender = event.sender;
@@ -2343,6 +2417,74 @@ ipcMain.on('mic-activity', (_event, payload = {}) => {
   logInfo(
     `MIC activity speaking=${speaking} rms=${rms} queuedFrames=${queuedFrames} lang=${sourceLang}->${targetLang}`
   );
+});
+
+ipcMain.handle('enroll-voice', async (_event, wavBase64) => {
+  const startMs = Date.now();
+  logInfo('Voice enrollment: received audio sample, extracting embedding...');
+
+  const apiKey = env('VACHANA_API_KEY_ID');
+  if (!apiKey) {
+    return { success: false, error: 'VACHANA_API_KEY_ID not set in .env' };
+  }
+
+  try {
+    const wavBuf = Buffer.from(wavBase64, 'base64');
+    logInfo(`Voice enrollment: WAV size=${wavBuf.length} bytes`);
+
+    const endpoint = env(
+      'VACHANA_VOICE_CLONE_EMBEDDING_ENDPOINT',
+      '/api/v1/tts/voice-clone/embeddings',
+    );
+    const url = buildUrl(endpoint);
+
+    const boundary = '----VCFormBoundary' + Date.now();
+    const bodyParts = [
+      `--${boundary}\r\n`,
+      'Content-Disposition: form-data; name="audio_file"; filename="enroll.wav"\r\n',
+      'Content-Type: audio/wav\r\n\r\n',
+    ];
+    const header = Buffer.from(bodyParts.join(''));
+    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([header, wavBuf, footer]);
+
+    const resp = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'X-API-Key-ID': apiKey,
+      },
+      body,
+    }, 30000);
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      logError(`Voice enrollment failed: status=${resp.status} body=${errText.slice(0, 300)}`);
+      return { success: false, error: `Server returned ${resp.status}` };
+    }
+
+    const json = await resp.json();
+    if (!json.success || !json.data?.voice_clone_embedding) {
+      logError(`Voice enrollment: unexpected response: ${JSON.stringify(json).slice(0, 500)}`);
+      return { success: false, error: json.message || 'No embedding in response' };
+    }
+
+    voiceCloneEmbedding = json.data.voice_clone_embedding;
+    logInfo(
+      `Voice enrollment SUCCESS elapsed_ms=${elapsedMs(startMs)} `
+      + `shape=${JSON.stringify(voiceCloneEmbedding.shape)} dtype=${voiceCloneEmbedding.dtype}`
+    );
+
+    const embeddingPath = path.join(getWorkspaceRoot(), 'workdir', 'voice_embedding.json');
+    fs.mkdirSync(path.dirname(embeddingPath), { recursive: true });
+    fs.writeFileSync(embeddingPath, JSON.stringify(voiceCloneEmbedding, null, 2), 'utf8');
+    logInfo(`Voice embedding saved to ${embeddingPath}`);
+
+    return { success: true };
+  } catch (err) {
+    logError(`Voice enrollment error: ${err.message}`);
+    return { success: false, error: err.message };
+  }
 });
 
 app.on('window-all-closed', () => {
