@@ -57,6 +57,7 @@ const TARGET_SAMPLE_RATE = 16000;
 const PREAMP_GAIN = 1.35;
 /** Lower = sooner first WS chunk plays; slightly higher = fewer tiny WAVs (smoother stream). */
 const TTS_CHUNK_AGGREGATE_MS = 90;
+const TTS_CHUNK_MIN_FLUSH_BYTES = 8;
 const TTS_SCHEDULE_LEAD_SEC = 0.04;
 const TTS_CHUNK_FADE_IN_SEC = 0.004;
 const ENFORCE_TARGET_ONLY_AUDIO = true;
@@ -575,12 +576,13 @@ function flushAggregatedTtsChunks(force = false) {
     return;
   }
 
-  if (!force && ttsChunkBytesQueue.length < 2) {
-    // Keep a tiny buffer to reduce micro-gaps between consecutive chunks.
+  const pendingBytes = ttsChunkBytesQueue.reduce((sum, arr) => sum + arr.length, 0);
+  if (!force && pendingBytes < TTS_CHUNK_MIN_FLUSH_BYTES) {
+    // Start playback quickly after a tiny warm-up buffer.
     return;
   }
 
-  const totalLen = ttsChunkBytesQueue.reduce((sum, arr) => sum + arr.length, 0);
+  const totalLen = pendingBytes;
   const merged = new Uint8Array(totalLen);
   let offset = 0;
   for (const arr of ttsChunkBytesQueue) {

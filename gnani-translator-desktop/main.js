@@ -12,6 +12,7 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
 // ---------- Google Cloud SDK clients (lazy-init on first use) ----------
 let _googleTranslateClient = null;
 let _googleTtsClient = null;
+let _googleTtsBetaClient = null;
 let _googleSpeechClient = null;
 
 function resolveGoogleKeyFile() {
@@ -37,6 +38,14 @@ function getGoogleTtsClient() {
     _googleTtsClient = new textToSpeech.TextToSpeechClient({ keyFilename: resolveGoogleKeyFile() });
   }
   return _googleTtsClient;
+}
+
+function getGoogleTtsBetaClient() {
+  if (!_googleTtsBetaClient) {
+    const textToSpeech = require('@google-cloud/text-to-speech');
+    _googleTtsBetaClient = new textToSpeech.v1beta1.TextToSpeechClient({ keyFilename: resolveGoogleKeyFile() });
+  }
+  return _googleTtsBetaClient;
 }
 
 function getGoogleSpeechClient() {
@@ -1137,8 +1146,8 @@ function googleTtsVoiceForLang(langCode) {
   }
   const lc = String(langCode).toLowerCase().split('-')[0];
   const defaults = {
-    hi: 'hi-IN-Neural2-A',
-    en: 'en-IN-Neural2-A',
+    hi: 'hi-IN-Chirp3-HD-Aoede',
+    en: 'en-US-Chirp3-HD-Aoede',
     bn: 'bn-IN-Wavenet-A',
     gu: 'gu-IN-Wavenet-A',
     kn: 'kn-IN-Wavenet-A',
@@ -1169,16 +1178,123 @@ function toBcp47(langCode) {
   return map[s] || s;
 }
 
-async function synthesizeTTSViaGoogle(text, langCode) {
+function inferLanguageCodeFromVoiceName(voiceName, fallbackLangCode) {
+  const requested = toBcp47(fallbackLangCode);
+  const m = String(voiceName || '').match(/^([a-z]{2,3}-[A-Z]{2,3})-/);
+  if (m && m[1]) {
+    return m[1];
+  }
+  return requested;
+}
+
+function buildWavHeader(pcmByteLength, sampleRate, numChannels = 1, bitsPerSample = 16) {
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcmByteLength, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcmByteLength, 40);
+  return header;
+}
+
+async function synthesizeTTSViaGoogle(text, langCode, opts = {}) {
+  const startMs = Date.now();
+  const client = getGoogleTtsBetaClient();
+  const bcp47 = toBcp47(langCode);
+  const voiceName = googleTtsVoiceForLang(bcp47);
+  const effectiveLanguageCode = inferLanguageCodeFromVoiceName(voiceName, bcp47);
+  const sampleRate = Number(env('GOOGLE_TTS_SAMPLE_RATE', '24000'));
+  const onPcmChunk = typeof opts.onPcmChunk === 'function' ? opts.onPcmChunk : null;
+  const firstEmitBytes = Math.max(1, Number(env('GOOGLE_TTS_STREAM_FIRST_EMIT_BYTES', '8')));
+
+  const stream = client.streamingSynthesize();
+
+  const audioChunks = [];
+  let pendingFirstChunk = Buffer.alloc(0);
+  let firstChunkEmitted = false;
+  const resultPromise = new Promise((resolve, reject) => {
+    stream.on('data', (response) => {
+      if (response.audioContent && response.audioContent.length > 0) {
+        const chunk = Buffer.from(response.audioContent);
+        audioChunks.push(chunk);
+
+        if (!onPcmChunk) {
+          return;
+        }
+
+        if (!firstChunkEmitted) {
+          pendingFirstChunk = Buffer.concat([pendingFirstChunk, chunk]);
+          if (pendingFirstChunk.length < firstEmitBytes) {
+            return;
+          }
+
+          onPcmChunk(pendingFirstChunk);
+          pendingFirstChunk = Buffer.alloc(0);
+          firstChunkEmitted = true;
+          return;
+        }
+
+        onPcmChunk(chunk);
+      }
+    });
+    stream.on('end', () => {
+      if (onPcmChunk && !firstChunkEmitted && pendingFirstChunk.length > 0) {
+        onPcmChunk(pendingFirstChunk);
+      }
+      resolve();
+    });
+    stream.on('error', reject);
+  });
+
+  stream.write({
+    streamingConfig: {
+      voice: { languageCode: effectiveLanguageCode, name: voiceName },
+      streamingAudioConfig: {
+        audioEncoding: 'PCM',
+        sampleRateHertz: sampleRate,
+      },
+    },
+  });
+
+  stream.write({
+    input: { text },
+  });
+
+  stream.end();
+
+  await resultPromise;
+
+  const pcm = Buffer.concat(audioChunks);
+  const wavHeader = buildWavHeader(pcm.length, sampleRate);
+  const buf = Buffer.concat([wavHeader, pcm]);
+  logInfo(
+    `Google TTS (streaming) elapsed_ms=${elapsedMs(startMs)} bytes=${buf.length} `
+    + `voice=${voiceName} lang=${effectiveLanguageCode}`
+  );
+  return buf;
+}
+
+async function synthesizeTTSViaGoogleSync(text, langCode) {
   const startMs = Date.now();
   const client = getGoogleTtsClient();
   const bcp47 = toBcp47(langCode);
   const voiceName = googleTtsVoiceForLang(bcp47);
+  const effectiveLanguageCode = inferLanguageCodeFromVoiceName(voiceName, bcp47);
   const sampleRate = Number(env('GOOGLE_TTS_SAMPLE_RATE', '24000'));
 
   const [response] = await client.synthesizeSpeech({
     input: { text },
-    voice: { languageCode: bcp47, name: voiceName },
+    voice: { languageCode: effectiveLanguageCode, name: voiceName },
     audioConfig: {
       audioEncoding: 'LINEAR16',
       sampleRateHertz: sampleRate,
@@ -1186,7 +1302,10 @@ async function synthesizeTTSViaGoogle(text, langCode) {
   });
 
   const buf = Buffer.from(response.audioContent);
-  logInfo(`Google TTS elapsed_ms=${elapsedMs(startMs)} bytes=${buf.length} voice=${voiceName}`);
+  logInfo(
+    `Google TTS (sync fallback) elapsed_ms=${elapsedMs(startMs)} bytes=${buf.length} `
+    + `voice=${voiceName} lang=${effectiveLanguageCode}`
+  );
   return buf;
 }
 
@@ -1245,9 +1364,11 @@ function loadSavedVoiceEmbedding() {
   }
 }
 
-async function synthesizeTTS(text, langCode) {
+async function synthesizeTTS(text, langCode, opts = {}) {
+  const provider = env('TTS_PROVIDER', 'google').toLowerCase();
   const vcEnabled = env('VOICE_CLONE_ENABLED', 'false').toLowerCase() === 'true';
-  if (vcEnabled && voiceCloneEmbedding) {
+  const useVoiceClone = provider !== 'google' && vcEnabled && !!voiceCloneEmbedding;
+  if (useVoiceClone) {
     try {
       return await synthesizeTTSVoiceClone(text);
     } catch (err) {
@@ -1255,13 +1376,17 @@ async function synthesizeTTS(text, langCode) {
     }
   }
 
-  const provider = env('TTS_PROVIDER', 'google').toLowerCase();
-
   if (provider === 'google') {
     const lang = langCode || activeConfig?.targetLanguage || env('VACHANA_DEFAULT_TARGET_LANGUAGE', 'hi-IN');
     try {
-      return await synthesizeTTSViaGoogle(text, lang);
+      return await synthesizeTTSViaGoogle(text, lang, opts);
     } catch (err) {
+      const allowSyncFallback = env('GOOGLE_TTS_STREAM_FALLBACK_TO_SYNC', 'true').toLowerCase() === 'true';
+      const isStreamingVoiceError = /only chirp 3: hd voices are supported for streaming synthesis/i.test(String(err.message || ''));
+      if (allowSyncFallback && isStreamingVoiceError) {
+        logError(`Google streaming TTS rejected voice; falling back to sync synthesizeSpeech: ${err.message}`);
+        return synthesizeTTSViaGoogleSync(text, lang);
+      }
       logError(`Google TTS error: ${err.message}. No fallback available.`);
       throw err;
     }
@@ -1410,8 +1535,26 @@ function splitTextForSequentialTts(text) {
   return chunks.filter(Boolean);
 }
 
-async function synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel = 'meeting', ttsLangCode = '') {
+async function synthesizeRestTtsSequentialToRenderer(
+  translatedText,
+  event,
+  playbackChannel = 'meeting',
+  ttsLangCode = '',
+  segmentId = null
+) {
+  const streamStartMs = Date.now();
   const parts = splitTextForSequentialTts(translatedText);
+  const ttsProvider = env('TTS_PROVIDER', 'google').toLowerCase();
+  const voiceCloneActive = ttsProvider !== 'google'
+    && env('VOICE_CLONE_ENABLED', 'false').toLowerCase() === 'true'
+    && !!voiceCloneEmbedding;
+  const streamGooglePcm = ttsProvider === 'google'
+    && !voiceCloneActive
+    && env('GOOGLE_TTS_STREAM_TO_RENDERER', 'true').toLowerCase() === 'true';
+  const firstAudioProvider = voiceCloneActive
+    ? 'voice-clone'
+    : (streamGooglePcm ? 'google-streaming' : (ttsProvider === 'google' ? 'google-wav' : 'rest-wav'));
+  const sampleRate = Number(env('GOOGLE_TTS_SAMPLE_RATE', '24000'));
   if (parts.length > 1) {
     logInfo(
       `TTS sequential: ${parts.length} chunk(s), max_chars=${env('VACHANA_TTS_MAX_CHARS_PER_CHUNK', '120')} `
@@ -1419,12 +1562,87 @@ async function synthesizeRestTtsSequentialToRenderer(translatedText, event, play
     );
   }
   let totalBytes = 0;
+  let totalPcmBytes = 0;
+  let emittedChunkCount = 0;
+  let firstChunkLatencyMs = null;
+  let firstChunkPartIndex = -1;
   for (let i = 0; i < parts.length; i += 1) {
-    const audioBuffer = await synthesizeTTS(parts[i], ttsLangCode);
+    if (streamGooglePcm) {
+      const chunkCountBeforePart = emittedChunkCount;
+      const audioBuffer = await synthesizeTTS(parts[i], ttsLangCode, {
+        onPcmChunk: (pcmChunk) => {
+          if (firstChunkLatencyMs === null) {
+            firstChunkLatencyMs = elapsedMs(streamStartMs);
+            firstChunkPartIndex = i;
+            logInfo(
+              `TTS first-audio segment=${segmentId || 'n/a'} first_chunk_ms=${firstChunkLatencyMs} `
+              + `part_index=${firstChunkPartIndex} provider=google-streaming`
+            );
+            writeEvent('segment_tts_first_audio', {
+              segment_id: segmentId || '',
+              first_chunk_ms: firstChunkLatencyMs,
+              part_index: firstChunkPartIndex,
+              provider: 'google-streaming',
+              sample_rate: sampleRate,
+            });
+          }
+          emittedChunkCount += 1;
+          totalPcmBytes += pcmChunk.length;
+          event.sender.send('translated-audio-chunk', {
+            audioBase64: pcmChunk.toString('base64'),
+            sampleRate,
+            numChannels: 1,
+            sampleWidth: 2,
+            channel: playbackChannel,
+          });
+        },
+      });
+      totalBytes += audioBuffer.length;
+      // Safety fallback: if no streaming chunk arrived for this part, send complete WAV.
+      if (emittedChunkCount === chunkCountBeforePart) {
+        logError(
+          `Google streaming returned no PCM chunks for segment=${segmentId || 'n/a'} part=${i}; `
+          + 'falling back to full WAV payload'
+        );
+        event.sender.send('translated-audio', {
+          mimeType: 'audio/wav',
+          audioBase64: audioBuffer.toString('base64'),
+          channel: playbackChannel,
+        });
+      }
+      continue;
+    }
+
+    const audioBuffer = await synthesizeTTS(parts[i], ttsLangCode, {});
     totalBytes += audioBuffer.length;
+    if (firstChunkLatencyMs === null) {
+      firstChunkLatencyMs = elapsedMs(streamStartMs);
+      firstChunkPartIndex = i;
+      logInfo(
+        `TTS first-audio segment=${segmentId || 'n/a'} first_chunk_ms=${firstChunkLatencyMs} `
+        + `part_index=${firstChunkPartIndex} provider=${firstAudioProvider}`
+      );
+      writeEvent('segment_tts_first_audio', {
+        segment_id: segmentId || '',
+        first_chunk_ms: firstChunkLatencyMs,
+        part_index: firstChunkPartIndex,
+        provider: firstAudioProvider,
+      });
+    }
     event.sender.send('translated-audio', {
       mimeType: 'audio/wav',
       audioBase64: audioBuffer.toString('base64'),
+      channel: playbackChannel,
+    });
+  }
+  if (streamGooglePcm) {
+    if (firstChunkLatencyMs === null) {
+      logInfo(`TTS first-audio segment=${segmentId || 'n/a'} first_chunk_ms=none provider=${firstAudioProvider}`);
+    }
+    event.sender.send('translated-audio-done', {
+      segmentId: segmentId || undefined,
+      chunkCount: emittedChunkCount,
+      byteCount: totalPcmBytes,
       channel: playbackChannel,
     });
   }
@@ -1740,7 +1958,7 @@ async function processTtsJobQueue() {
 
     try {
       const ttsProvider = env('TTS_PROVIDER', 'google').toLowerCase();
-      // WS streaming TTS only applies to Vachana; Google TTS is REST-only (still fast).
+      // WS realtime TTS is for Vachana; Google TTS uses gRPC streaming_synthesize.
       const ttsRealtimeEnabled = ttsProvider !== 'google' && env('ENABLE_TTS_REALTIME_WS', 'false').toLowerCase() === 'true';
       const ttsStartMs = Date.now();
       if (ttsRealtimeEnabled) {
@@ -1801,7 +2019,13 @@ async function processTtsJobQueue() {
           }
 
           logError(`TTS realtime failed; using REST fallback: ${wsError.message}`);
-          const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel, ttsLangCode);
+          const audioBytes = await synthesizeRestTtsSequentialToRenderer(
+            translatedText,
+            event,
+            playbackChannel,
+            ttsLangCode,
+            segmentId
+          );
           writeEvent('segment_tts', {
             segment_id: segmentId,
             audio_bytes: audioBytes,
@@ -1821,7 +2045,13 @@ async function processTtsJobQueue() {
         }
       } else {
         const ttsMode = env('TTS_PROVIDER', 'google').toLowerCase() === 'google' ? 'google-tts' : 'rest';
-        const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel, ttsLangCode);
+        const audioBytes = await synthesizeRestTtsSequentialToRenderer(
+          translatedText,
+          event,
+          playbackChannel,
+          ttsLangCode,
+          segmentId
+        );
         writeEvent('segment_tts', {
           segment_id: segmentId,
           audio_bytes: audioBytes,
