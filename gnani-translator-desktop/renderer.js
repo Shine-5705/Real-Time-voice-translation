@@ -57,7 +57,7 @@ const TARGET_SAMPLE_RATE = 16000;
 const PREAMP_GAIN = 1.35;
 /** Lower = sooner first WS chunk plays; slightly higher = fewer tiny WAVs (smoother stream). */
 const TTS_CHUNK_AGGREGATE_MS = 90;
-const TTS_CHUNK_MIN_FLUSH_BYTES = 8;
+const TTS_CHUNK_MIN_FLUSH_BYTES = 2048;
 const TTS_SCHEDULE_LEAD_SEC = 0.04;
 const TTS_CHUNK_FADE_IN_SEC = 0.004;
 const ENFORCE_TARGET_ONLY_AUDIO = true;
@@ -491,10 +491,8 @@ async function playTtsBlobScheduled(blob, channel) {
     meetingTtsGateUntil = Date.now() + (audioBuffer.duration * 1000) + gateBufferMs;
   }
 
-  const waitSec = endAt - ctx.currentTime;
-  if (waitSec > 0) {
-    await new Promise((r) => setTimeout(r, waitSec * 1000));
-  }
+  // Important: do not block until chunk end. Returning immediately lets the
+  // chain schedule upcoming chunks ahead of time, reducing underrun stutter.
 }
 
 function enqueueScheduledTtsPlayback(blob, channel) {
