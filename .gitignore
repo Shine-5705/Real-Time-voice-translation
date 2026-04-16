@@ -4,10 +4,11 @@ __pycache__/
 *$py.class
 
 # C extensions
-
+.json
 *.so
 gnani-translator-desktop\node_modules
 Video dubbing Gnani
+ai-translation-app-493204-0353b0f7de43.json
 workdir
 # Distribution / packaging
 .Python
