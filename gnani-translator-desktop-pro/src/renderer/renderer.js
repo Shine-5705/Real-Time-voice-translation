@@ -3,6 +3,8 @@ const stopBtn = document.getElementById('stopBtn');
 const statusEl = document.getElementById('status');
 const micSelect = document.getElementById('micSelect');
 const outputSelect = document.getElementById('outputSelect');
+const platformSelect = document.getElementById('platformSelect');
+const deliveryModeSelect = document.getElementById('deliveryModeSelect');
 const sourceLangSelect = document.getElementById('sourceLang');
 const targetLangSelect = document.getElementById('targetLang');
 const transcriptBox = document.getElementById('transcriptBox');
@@ -71,6 +73,8 @@ const MIC_ADAPTIVE_GATE_ENABLED = true;
 const MIC_ADAPTIVE_SPEECH_DB = 12;
 const MIC_ADAPTIVE_HANGOVER_FRAMES = 4;
 const MIC_ADAPTIVE_FLOOR_LEAK = 0.04;
+const FULL_DUPLEX_OVERLAP_CAPTURE = true;
+const OVERLAP_ATTENUATION_GAIN = 0.35;
 let adaptiveNoiseFloor = 0.002;
 let adaptiveHangoverLeft = 0;
 const MIC_HIGHPASS_HZ = 120;
@@ -92,6 +96,14 @@ const LANGUAGES = [
   ['te-IN', 'Telugu'],
   ['en-hi-IN-latn', 'Hinglish (Latin)'],
 ];
+
+function selectedPlatform() {
+  return String((platformSelect && platformSelect.value) || 'teams').toLowerCase();
+}
+
+function selectedDeliveryMode() {
+  return String((deliveryModeSelect && deliveryModeSelect.value) || 'assist').toLowerCase();
+}
 
 function appendTranscriptLine(text, cssClass = '') {
   const line = document.createElement('div');
@@ -767,7 +779,7 @@ async function startListenPipeline(listenDeviceId) {
       returnPassedFrames = 0;
     }
 
-    if (ttsGated || micGated) {
+    if (!FULL_DUPLEX_OVERLAP_CAPTURE && (ttsGated || micGated)) {
       returnGatedFrames += 1;
       return;
     }
@@ -776,7 +788,11 @@ async function startListenPipeline(listenDeviceId) {
     const inputRate = e.inputBuffer.sampleRate || returnAudioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
-    const boosted = applyGain(resampled, 2.0);
+    let boosted = applyGain(resampled, 2.0);
+    if (FULL_DUPLEX_OVERLAP_CAPTURE && (ttsGated || micGated)) {
+      // In overlap conversations, attenuate instead of dropping so both sides are still transcribed.
+      boosted = applyGain(boosted, OVERLAP_ATTENUATION_GAIN);
+    }
     sendPCMToSTTReturn(toInt16(boosted));
   };
 
@@ -843,7 +859,7 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
       fwdPassedFrames = 0;
     }
 
-    if (now < localTtsGateUntil) {
+    if (!FULL_DUPLEX_OVERLAP_CAPTURE && now < localTtsGateUntil) {
       fwdGatedFrames += 1;
       return;
     }
@@ -854,7 +870,11 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
     const resampled = resampleTo16k(channel, inputRate);
     const adaptive = applyAdaptiveSpeechGate(resampled);
     const gated = applySoftNoiseGate(adaptive);
-    const boosted = applyGain(gated, PREAMP_GAIN);
+    let boosted = applyGain(gated, PREAMP_GAIN);
+    if (FULL_DUPLEX_OVERLAP_CAPTURE && now < localTtsGateUntil) {
+      // Preserve near-simultaneous turn-taking by reducing level instead of hard gate.
+      boosted = applyGain(boosted, OVERLAP_ATTENUATION_GAIN);
+    }
     emitMicTelemetry(boosted);
 
     const rms = computeRms(boosted);
@@ -900,6 +920,8 @@ function validateLanguages() {
 startBtn.addEventListener('click', () => {
   const selectedMic = micSelect.value;
   const selectedOutput = outputSelect.value;
+  const platform = selectedPlatform();
+  const deliveryMode = selectedDeliveryMode();
   if (!selectedMic || !selectedOutput) {
     statusEl.textContent = 'Status: Select both microphone and output device';
     return;
@@ -918,6 +940,10 @@ startBtn.addEventListener('click', () => {
   }
 
   const bidir = Boolean(bidirectionalToggle && bidirectionalToggle.checked);
+  if (platform === 'genesys' && deliveryMode === 'both' && !bidir) {
+    statusEl.textContent = 'Status: Genesys "Assist + Inject" requires Bidirectional mode enabled.';
+    return;
+  }
   let listenDeviceId = '';
   let localOutId = '';
   if (bidir) {
@@ -953,11 +979,20 @@ startBtn.addEventListener('click', () => {
         targetLanguage: targetLangSelect.value,
         speakerPreferenceMode: guestSpeakerToggle && guestSpeakerToggle.checked ? 'lock_first' : 'off',
         bidirectional: bidir,
+        platform,
+        deliveryMode,
+        bridgeEnabled: platform === 'genesys' && (deliveryMode === 'inject' || deliveryMode === 'both'),
       });
       startBtn.disabled = true;
       stopBtn.disabled = false;
       clearTranscript();
       appendTranscriptLine('Listening for speech...', 'line-muted');
+      if (platform === 'genesys') {
+        statusEl.textContent = bidir
+          ? `Status: Genesys ${deliveryMode} active — your speech -> virtual output; team speech -> headphones.`
+          : `Status: Genesys ${deliveryMode} active (target-only). Genesys mic must use CABLE Output.`;
+        return;
+      }
       statusEl.textContent = bidir
         ? 'Status: Bidirectional — your speech → meeting (virtual output); team speech → headphones.'
         : 'Status: Realtime translation active (target-only). Teams Mic must be CABLE Output.';
@@ -1064,6 +1099,18 @@ window.electronAPI.onTranslationStatus((payload) => {
     stopBtn.disabled = true;
   }
 });
+
+if (window.electronAPI.onGenesysBridgeStatus) {
+  window.electronAPI.onGenesysBridgeStatus((payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const running = payload.running ? 'running' : 'stopped';
+    const connected = payload.connected ? 'connected' : 'disconnected';
+    appendTranscriptLine(
+      `Genesys bridge ${running}/${connected}: ${payload.message || 'ok'}`,
+      'line-muted'
+    );
+  });
+}
 
 window.electronAPI.onTranscript((payload) => {
   const spk = payload.speakerId ? ` [${payload.speakerId}]` : '';

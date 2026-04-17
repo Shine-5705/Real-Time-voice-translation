@@ -12,6 +12,8 @@ const { createRestLoopSttService } = require('../services/stt/restLoopService');
 const { createArtifactService } = require('../services/artifacts/artifactService');
 const { createTranscriptQueueService } = require('./queue/transcriptQueueService');
 const { createTtsQueueService } = require('./queue/ttsQueueService');
+const { createGenesysBridgeService } = require('../services/genesys/bridgeService');
+const { normalizeTranscriptMessage } = require('../services/genesys/mediaAdapter');
 const {
   normalizeLangCode,
   toVachanaLanguageCode,
@@ -102,6 +104,8 @@ function bootRuntime({ app, createMainWindow }) {
     recentIncomingSourceContext: [],
     recentIncomingTargetContext: [],
     voiceCloneEmbedding: null,
+    platform: 'teams',
+    deliveryMode: 'assist',
   };
 
   const googleClients = createGoogleClients({ env, appDir });
@@ -190,6 +194,39 @@ function bootRuntime({ app, createMainWindow }) {
     event.sender.send('translation-status', { running, message });
   }
 
+  function broadcastGenesysBridgeStatus(payload) {
+    if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+      state.mainWindow.webContents.send('genesys-bridge-status', payload);
+    }
+    if (state.activeSender && state.mainWindow && state.activeSender !== state.mainWindow.webContents) {
+      try {
+        state.activeSender.send('genesys-bridge-status', payload);
+      } catch (_err) {
+        // no-op
+      }
+    }
+  }
+
+  const genesysBridgeService = createGenesysBridgeService({
+    env,
+    logInfo,
+    logError,
+    normalizeTranscriptMessage,
+    onStatus: (payload) => {
+      artifacts.writeEvent('genesys_bridge_status', payload);
+      broadcastGenesysBridgeStatus(payload);
+    },
+    onTranscript: (transcriptPayload) => {
+      const bridgeEvent = { sender: state.mainWindow?.webContents || state.activeSender };
+      if (!bridgeEvent.sender) return;
+      if (String(transcriptPayload.direction || '').toLowerCase() === 'in') {
+        enqueueTranscriptIncoming(bridgeEvent, transcriptPayload);
+        return;
+      }
+      enqueueTranscript(bridgeEvent, transcriptPayload);
+    },
+  });
+
   const ttsQueue = createTtsQueueService({
     env,
     logInfo,
@@ -201,6 +238,21 @@ function bootRuntime({ app, createMainWindow }) {
     writePipelineRow: artifacts.writePipelineRow,
     sendStatus,
     getState,
+    onTtsChunk: (chunkPayload) => {
+      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
+        genesysBridgeService.publishTtsChunk(chunkPayload);
+      }
+    },
+    onTtsAudio: (audioPayload) => {
+      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
+        genesysBridgeService.publishTtsAudio(audioPayload);
+      }
+    },
+    onTtsDone: (donePayload) => {
+      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
+        genesysBridgeService.publishTtsDone(donePayload);
+      }
+    },
   });
 
   const transcriptQueue = createTranscriptQueueService({
@@ -303,6 +355,7 @@ function bootRuntime({ app, createMainWindow }) {
       try { state.sttSocketReturn.close(); } catch (_e) {}
       state.sttSocketReturn = null;
     }
+    genesysBridgeService.stop('Pipeline teardown');
     artifacts.writePipelineSummary();
   }
 
@@ -312,6 +365,8 @@ function bootRuntime({ app, createMainWindow }) {
       const sourceLanguage = config.sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN');
       const targetLanguage = config.targetLanguage || env('VACHANA_DEFAULT_TARGET_LANGUAGE', 'hi-IN');
       const bidirectionalRequested = Boolean(config.bidirectional);
+      const platform = String(config.platform || 'teams').toLowerCase();
+      const deliveryMode = String(config.deliveryMode || 'assist').toLowerCase();
       const listenDeviceId = String(config.listenDeviceId || '').trim();
       const localOutputDeviceId = String(config.localOutputDeviceId || '').trim();
       artifacts.initSessionArtifacts(appDir, sourceLanguage, targetLanguage);
@@ -319,6 +374,8 @@ function bootRuntime({ app, createMainWindow }) {
         source_language: sourceLanguage,
         target_language: targetLanguage,
         bidirectional: bidirectionalRequested,
+        platform,
+        delivery_mode: deliveryMode,
         listen_device_id: listenDeviceId,
         local_output_device_id: localOutputDeviceId,
       });
@@ -326,9 +383,13 @@ function bootRuntime({ app, createMainWindow }) {
         sourceLanguage,
         targetLanguage,
         bidirectional: bidirectionalRequested,
+        platform,
+        deliveryMode,
         listenDeviceId,
         localOutputDeviceId,
       };
+      state.platform = platform;
+      state.deliveryMode = deliveryMode;
       state.translationRunning = true;
       state.sttMode = 'ws';
       state.segmentCounter = 0;
@@ -338,6 +399,22 @@ function bootRuntime({ app, createMainWindow }) {
       state.recentTargetContext = [];
       state.recentIncomingSourceContext = [];
       state.recentIncomingTargetContext = [];
+
+      if (platform === 'genesys' && (deliveryMode === 'inject' || deliveryMode === 'both')) {
+        genesysBridgeService.start({
+          deliveryMode,
+          sessionId: config.sessionId || '',
+          streamEndpoint: config.streamEndpoint || '',
+        }).catch((err) => {
+          logError(`Genesys bridge start failed: ${err.message}`);
+          broadcastGenesysBridgeStatus({
+            ...genesysBridgeService.status(),
+            message: `Start failed: ${err.message}`,
+          });
+        });
+      } else {
+        genesysBridgeService.stop('Bridge disabled for current mode');
+      }
 
       if (state.metricsTimer) clearInterval(state.metricsTimer);
       state.metricsTimer = setInterval(() => {
@@ -352,24 +429,24 @@ function bootRuntime({ app, createMainWindow }) {
         restLoops.startRestSttFallback({ state, setState, event, sourceLanguage, enqueueTranscript });
         if (bidirectionalRequested) {
           restLoops.startRestSttReturnPath({ state, event, targetLanguage, enqueueTranscriptIncoming });
-          return sendStatus(event, true, `Bidirectional REST mode: you (${sourceLanguage}) → meeting; team (${targetLanguage}) → headphones.`);
+          return sendStatus(event, true, `Bidirectional REST mode [${platform}/${deliveryMode}]: you (${sourceLanguage}) → meeting; team (${targetLanguage}) → headphones.`);
         }
-        return sendStatus(event, true, `Pipeline started in REST mode (${sourceLanguage} -> ${targetLanguage}).`);
+        return sendStatus(event, true, `Pipeline started in REST mode (${sourceLanguage} -> ${targetLanguage}) [${platform}/${deliveryMode}].`);
       }
 
       realtimeWs.connectSTT(event, sourceLanguage)
         .then(() => {
           state.sttMode = 'ws';
           if (!state.activeConfig.bidirectional) {
-            sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}).`);
+            sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}) [${platform}/${deliveryMode}].`);
             return;
           }
           return realtimeWs.connectSTTReturn(event, targetLanguage)
-            .then(() => sendStatus(event, true, `Bidirectional: you → ${targetLanguage} (meeting); team → ${sourceLanguage} (headphones).`))
+            .then(() => sendStatus(event, true, `Bidirectional [${platform}/${deliveryMode}]: you → ${targetLanguage} (meeting); team → ${sourceLanguage} (headphones).`))
             .catch((err) => {
               state.activeConfig.bidirectional = false;
               logError(`Return STT connect failed: ${err.message}`);
-              sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}). Team listen disabled: ${err.message}`);
+              sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}) [${platform}/${deliveryMode}]. Team listen disabled: ${err.message}`);
             });
         })
         .catch((error) => {
@@ -390,6 +467,27 @@ function bootRuntime({ app, createMainWindow }) {
       artifacts.writeEvent('session_stop', {});
       teardownPipeline();
       sendStatus(event, false, 'Translation stopped.');
+    });
+
+    ipcMain.handle('genesys-bridge-start', async (_event, bridgeConfig = {}) => {
+      const mergedConfig = {
+        deliveryMode: bridgeConfig.deliveryMode || state.deliveryMode || 'assist',
+        sessionId: bridgeConfig.sessionId || '',
+        streamEndpoint: bridgeConfig.streamEndpoint || '',
+      };
+      const status = await genesysBridgeService.start(mergedConfig);
+      broadcastGenesysBridgeStatus({ ...status, message: 'Bridge started via IPC' });
+      return status;
+    });
+
+    ipcMain.handle('genesys-bridge-stop', async () => {
+      const status = genesysBridgeService.stop('Bridge stopped via IPC');
+      broadcastGenesysBridgeStatus({ ...status, message: 'Bridge stopped via IPC' });
+      return status;
+    });
+
+    ipcMain.handle('genesys-bridge-status', async () => {
+      return genesysBridgeService.status();
     });
 
     ipcMain.on('audio-chunk', (_event, chunkBytes) => {

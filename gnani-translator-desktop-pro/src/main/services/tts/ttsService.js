@@ -228,7 +228,8 @@ function createTtsService({
     event,
     playbackChannel = 'meeting',
     ttsLangCode = '',
-    segmentId = null
+    segmentId = null,
+    hooks = {}
   ) {
     const parts = splitTextForSequentialTts(translatedText);
     const ttsProvider = env('TTS_PROVIDER', 'google').toLowerCase();
@@ -252,6 +253,15 @@ function createTtsService({
               sampleWidth: 2,
               channel: playbackChannel,
             });
+            if (typeof hooks.onChunk === 'function') {
+              hooks.onChunk({
+                audioBase64: pcmChunk.toString('base64'),
+                sampleRate,
+                numChannels: 1,
+                sampleWidth: 2,
+                channel: playbackChannel,
+              });
+            }
           },
         });
         totalBytes += audioBuffer.length;
@@ -261,6 +271,13 @@ function createTtsService({
             audioBase64: audioBuffer.toString('base64'),
             channel: playbackChannel,
           });
+          if (typeof hooks.onAudio === 'function') {
+            hooks.onAudio({
+              mimeType: 'audio/wav',
+              audioBase64: audioBuffer.toString('base64'),
+              channel: playbackChannel,
+            });
+          }
         }
       } else {
         const audioBuffer = await synthesizeTTS(parts[i], ttsLangCode, {});
@@ -270,15 +287,24 @@ function createTtsService({
           audioBase64: audioBuffer.toString('base64'),
           channel: playbackChannel,
         });
+        if (typeof hooks.onAudio === 'function') {
+          hooks.onAudio({
+            mimeType: 'audio/wav',
+            audioBase64: audioBuffer.toString('base64'),
+            channel: playbackChannel,
+          });
+        }
       }
     }
     if (streamGooglePcm) {
-      event.sender.send('translated-audio-done', {
+      const donePayload = {
         segmentId: segmentId || undefined,
         chunkCount: emittedChunkCount,
         byteCount: totalPcmBytes,
         channel: playbackChannel,
-      });
+      };
+      event.sender.send('translated-audio-done', donePayload);
+      if (typeof hooks.onDone === 'function') hooks.onDone(donePayload);
     }
     return totalBytes;
   }

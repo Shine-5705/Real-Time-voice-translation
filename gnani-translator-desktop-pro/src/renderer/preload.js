@@ -6,8 +6,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendAudioChunk: (chunkBytes) => ipcRenderer.send('audio-chunk', chunkBytes),
   sendAudioChunkReturn: (chunkBytes) => ipcRenderer.send('audio-chunk-return', chunkBytes),
   sendMicActivity: (payload) => ipcRenderer.send('mic-activity', payload),
+  startGenesysBridge: (config) => ipcRenderer.invoke('genesys-bridge-start', config || {}),
+  stopGenesysBridge: () => ipcRenderer.invoke('genesys-bridge-stop'),
+  getGenesysBridgeStatus: () => ipcRenderer.invoke('genesys-bridge-status'),
   onTranslationStatus: (callback) => {
     ipcRenderer.on('translation-status', (_event, payload) => callback(payload));
+  },
+  onGenesysBridgeStatus: (callback) => {
+    ipcRenderer.on('genesys-bridge-status', (_event, payload) => callback(payload));
   },
   onTranscript: (callback) => {
     ipcRenderer.on('transcript', (_event, payload) => callback(payload));

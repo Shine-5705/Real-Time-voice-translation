@@ -28,6 +28,18 @@ npm install
 npm start
 ```
 
+## Genesys Cloud CX integration env
+
+Set these keys in your repo `.env` when using Genesys mode:
+
+- `GENESYS_CLIENT_ID` - Genesys Cloud OAuth client id
+- `GENESYS_CLIENT_SECRET` - Genesys Cloud OAuth client secret
+- `GENESYS_REGION` - region hostname shorthand (for example `mypurecloud.com`)
+- `GENESYS_INTEGRATION_MODE` - default mode: `assist`, `inject`, or `both`
+- `GENESYS_STREAM_ENDPOINT` - WebSocket endpoint for bridge media/transcript stream
+- `GENESYS_BRIDGE_API_KEY` - optional bearer key for your bridge endpoint
+- `GENESYS_BRIDGE_RECONNECT_MAX_MS` - max reconnect backoff in ms (default `30000`)
+
 ## Phase 1 (implemented)
 
 The app now boots the **full existing working pipeline** from

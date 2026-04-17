@@ -9,6 +9,9 @@ function createTtsQueueService({
   writePipelineRow,
   sendStatus,
   getState,
+  onTtsChunk,
+  onTtsAudio,
+  onTtsDone,
 }) {
   const ttsJobQueue = [];
   let ttsWorkerActive = false;
@@ -40,6 +43,7 @@ function createTtsQueueService({
 
       try {
         const ttsProvider = env('TTS_PROVIDER', 'google').toLowerCase();
+        const googleStreamToRenderer = ttsProvider === 'google' && env('GOOGLE_TTS_STREAM_TO_RENDERER', 'true').toLowerCase() === 'true';
         const ttsRealtimeEnabled = ttsProvider !== 'google' && env('ENABLE_TTS_REALTIME_WS', 'false').toLowerCase() === 'true';
         const ttsStartMs = Date.now();
         if (ttsRealtimeEnabled) {
@@ -59,27 +63,64 @@ function createTtsQueueService({
               container,
               voice,
               onChunk: (chunk) => {
-                event.sender.send('translated-audio-chunk', {
+                const payload = {
                   audioBase64: chunk.toString('base64'),
                   sampleRate,
                   numChannels: Number(env('VACHANA_TTS_NUM_CHANNELS', '1')),
                   sampleWidth: Number(env('VACHANA_TTS_SAMPLE_WIDTH', '2')),
                   channel: playbackChannel,
-                });
+                };
+                event.sender.send('translated-audio-chunk', payload);
+                if (typeof onTtsChunk === 'function') onTtsChunk(payload);
               },
             });
-            event.sender.send('translated-audio-done', { segmentId, chunkCount: stats.chunkCount, byteCount: stats.byteCount, channel: playbackChannel });
+            const donePayload = {
+              segmentId,
+              chunkCount: stats.chunkCount,
+              byteCount: stats.byteCount,
+              channel: playbackChannel,
+            };
+            event.sender.send('translated-audio-done', donePayload);
+            if (typeof onTtsDone === 'function') onTtsDone(donePayload);
             writeEvent('segment_tts', { segment_id: segmentId, audio_bytes: stats.byteCount, chunk_count: stats.chunkCount, mode: 'realtime-ws' });
           } catch (wsError) {
             const restFallbackEnabled = env('ENABLE_TTS_REST_FALLBACK_ON_WS_ERROR', 'true').toLowerCase() === 'true';
             if (!restFallbackEnabled) throw wsError;
             logError(`TTS realtime failed; using REST fallback: ${wsError.message}`);
-            const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel, ttsLangCode, segmentId);
+            const audioBytes = await synthesizeRestTtsSequentialToRenderer(
+              translatedText,
+              event,
+              playbackChannel,
+              ttsLangCode,
+              segmentId,
+              {
+                onChunk: onTtsChunk,
+                onAudio: onTtsAudio,
+                onDone: onTtsDone,
+              }
+            );
+            if (!googleStreamToRenderer && typeof onTtsDone === 'function') {
+              onTtsDone({ segmentId, byteCount: audioBytes, chunkCount: 0, channel: playbackChannel });
+            }
             writeEvent('segment_tts', { segment_id: segmentId, audio_bytes: audioBytes, mode: 'rest-fallback', realtime_error: wsError.message });
           }
         } else {
           const ttsMode = ttsProvider === 'google' ? 'google-tts' : 'rest';
-          const audioBytes = await synthesizeRestTtsSequentialToRenderer(translatedText, event, playbackChannel, ttsLangCode, segmentId);
+          const audioBytes = await synthesizeRestTtsSequentialToRenderer(
+            translatedText,
+            event,
+            playbackChannel,
+            ttsLangCode,
+            segmentId,
+            {
+              onChunk: onTtsChunk,
+              onAudio: onTtsAudio,
+              onDone: onTtsDone,
+            }
+          );
+          if (!googleStreamToRenderer && typeof onTtsDone === 'function') {
+            onTtsDone({ segmentId, byteCount: audioBytes, chunkCount: 0, channel: playbackChannel });
+          }
           writeEvent('segment_tts', { segment_id: segmentId, audio_bytes: audioBytes, mode: ttsMode });
         }
 

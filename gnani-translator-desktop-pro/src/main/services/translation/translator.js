@@ -10,6 +10,79 @@ function createTranslator({
   normalizeLangCode,
   getGoogleTranslateClient,
 }) {
+  const translationCache = new Map();
+
+  function cacheKey(text, sourceLanguage, targetLanguage) {
+    return `${normalizeLangCode(sourceLanguage)}::${normalizeLangCode(targetLanguage)}::${String(text || '').trim().toLowerCase()}`;
+  }
+
+  function getCachedTranslation(text, sourceLanguage, targetLanguage) {
+    const ttlMs = Number(env('TRANSLATE_CACHE_TTL_MS', '60000'));
+    if (ttlMs <= 0) return '';
+    const key = cacheKey(text, sourceLanguage, targetLanguage);
+    const hit = translationCache.get(key);
+    if (!hit) return '';
+    if (Date.now() - Number(hit.ts || 0) > ttlMs) {
+      translationCache.delete(key);
+      return '';
+    }
+    return String(hit.value || '');
+  }
+
+  function setCachedTranslation(text, sourceLanguage, targetLanguage, translated) {
+    const ttlMs = Number(env('TRANSLATE_CACHE_TTL_MS', '60000'));
+    if (ttlMs <= 0) return;
+    const key = cacheKey(text, sourceLanguage, targetLanguage);
+    translationCache.set(key, { ts: Date.now(), value: translated });
+    const maxEntries = Number(env('TRANSLATE_CACHE_MAX_ENTRIES', '500'));
+    if (translationCache.size > maxEntries) {
+      const first = translationCache.keys().next();
+      if (!first.done) translationCache.delete(first.value);
+    }
+  }
+
+  async function withTimeout(promise, timeoutMs, label) {
+    const timeout = Number(timeoutMs || 0);
+    if (!timeout || timeout <= 0) return promise;
+    let timer = null;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timeout after ${timeout}ms`)), timeout);
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
+  async function hedgedGoogleTranslate(text, sourceLanguage, targetLanguage) {
+    const fallbackEnabled = env('ENABLE_PUBLIC_TRANSLATE_FALLBACK', 'true').toLowerCase() === 'true';
+    const hedgeEnabled = env('ENABLE_TRANSLATE_HEDGED_FALLBACK', 'true').toLowerCase() === 'true';
+    const googleTimeoutMs = Number(env('GOOGLE_TRANSLATE_TIMEOUT_MS', '1800'));
+    if (!fallbackEnabled || !hedgeEnabled) {
+      return withTimeout(
+        translateViaGoogle(text, sourceLanguage, targetLanguage),
+        googleTimeoutMs,
+        'Google Translate'
+      );
+    }
+
+    const hedgeDelayMs = Number(env('TRANSLATE_HEDGE_DELAY_MS', '350'));
+    const googlePromise = withTimeout(
+      translateViaGoogle(text, sourceLanguage, targetLanguage),
+      googleTimeoutMs,
+      'Google Translate'
+    );
+    const fallbackPromise = new Promise((resolve, reject) => {
+      setTimeout(() => {
+        translateViaPublicFallback(text, sourceLanguage, targetLanguage).then(resolve).catch(reject);
+      }, Math.max(0, hedgeDelayMs));
+    });
+
+    const winner = await Promise.any([googlePromise, fallbackPromise]);
+    return String(winner || '').trim();
+  }
+
   async function translateViaPublicFallback(text, sourceLanguage, targetLanguage) {
     const sl = normalizeLangCode(sourceLanguage);
     const tl = normalizeLangCode(targetLanguage);
@@ -49,14 +122,23 @@ function createTranslator({
     }
 
     const provider = env('TRANSLATION_PROVIDER', 'google').toLowerCase();
+    const cached = getCachedTranslation(text, sourceLanguage, targetLanguage);
+    if (cached) {
+      logInfo(`Translate cache hit len=${cached.length}`);
+      return cached;
+    }
 
     if (provider === 'google') {
       try {
-        return await translateViaGoogle(text, sourceLanguage, targetLanguage);
+        const translated = await hedgedGoogleTranslate(text, sourceLanguage, targetLanguage);
+        if (translated) setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
+        return translated;
       } catch (err) {
         logError(`Google Translate error: ${err.message}`);
         logInfo('Google Translate failed. Trying public fallback.');
-        return translateViaPublicFallback(text, sourceLanguage, targetLanguage);
+        const translated = await translateViaPublicFallback(text, sourceLanguage, targetLanguage);
+        if (translated) setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
+        return translated;
       }
     }
 
@@ -109,6 +191,7 @@ function createTranslator({
         const translated = parseTranslationText(payload);
         if (translated) {
           logInfo(`Translate parsed endpoint=${url} translated_len=${translated.length} elapsed_ms=${elapsedMs(translateReqStartMs)}`);
+          setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
           return translated;
         }
 
@@ -126,7 +209,9 @@ function createTranslator({
     }
 
     logInfo(`Primary translate failed (${lastError}). Trying fallback translator.`);
-    return translateViaPublicFallback(text, sourceLanguage, targetLanguage);
+    const translated = await translateViaPublicFallback(text, sourceLanguage, targetLanguage);
+    if (translated) setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
+    return translated;
   }
 
   return {
