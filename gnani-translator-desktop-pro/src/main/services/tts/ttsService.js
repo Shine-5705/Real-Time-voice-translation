@@ -234,6 +234,7 @@ function createTtsService({
     const parts = splitTextForSequentialTts(translatedText);
     const ttsProvider = env('TTS_PROVIDER', 'google').toLowerCase();
     const streamGooglePcm = ttsProvider === 'google' && env('GOOGLE_TTS_STREAM_TO_RENDERER', 'true').toLowerCase() === 'true';
+    const requireGoogleChunks = env('GOOGLE_TTS_REQUIRE_CHUNKS', 'true').toLowerCase() === 'true';
     const sampleRate = Number(env('GOOGLE_TTS_SAMPLE_RATE', '24000'));
 
     let totalBytes = 0;
@@ -268,6 +269,9 @@ function createTtsService({
         });
         totalBytes += audioBuffer.length;
         if (before === emittedChunkCount) {
+          if (requireGoogleChunks) {
+            throw new Error('Google streaming returned no PCM chunks for segment');
+          }
           event.sender.send('translated-audio', {
             segmentId: segmentId || undefined,
             mimeType: 'audio/wav',

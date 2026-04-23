@@ -97,7 +97,17 @@ function createTtsQueueService({
               {
                 onChunk: onTtsChunk,
                 onAudio: onTtsAudio,
-                onDone: onTtsDone,
+                onDone: (donePayload) => {
+                  if (typeof onTtsDone === 'function') onTtsDone(donePayload);
+                  writeEvent('segment_tts_streaming', {
+                    segment_id: segmentId,
+                    provider: 'google',
+                    mode: 'streaming',
+                    chunk_count: Number(donePayload?.chunkCount || 0),
+                    byte_count: Number(donePayload?.byteCount || 0),
+                    channel: playbackChannel,
+                  });
+                },
               }
             );
             if (!googleStreamToRenderer && typeof onTtsDone === 'function') {
@@ -116,7 +126,17 @@ function createTtsQueueService({
             {
               onChunk: onTtsChunk,
               onAudio: onTtsAudio,
-              onDone: onTtsDone,
+              onDone: (donePayload) => {
+                if (typeof onTtsDone === 'function') onTtsDone(donePayload);
+                writeEvent('segment_tts_streaming', {
+                  segment_id: segmentId,
+                  provider: 'google',
+                  mode: 'streaming',
+                  chunk_count: Number(donePayload?.chunkCount || 0),
+                  byte_count: Number(donePayload?.byteCount || 0),
+                  channel: playbackChannel,
+                });
+              },
             }
           );
           if (!googleStreamToRenderer && typeof onTtsDone === 'function') {
