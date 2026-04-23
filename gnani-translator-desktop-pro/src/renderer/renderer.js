@@ -96,6 +96,34 @@ const LANGUAGES = [
   ['te-IN', 'Telugu'],
   ['en-hi-IN-latn', 'Hinglish (Latin)'],
 ];
+const transcriptPairsById = new Map();
+const OUTGOING_CLIP_WINDOW_MS = 4500;
+const INCOMING_CLIP_WINDOW_MS = 4500;
+const outgoingPcmHistory = [];
+const incomingPcmHistory = [];
+
+function pushPcmHistory(history, bytes) {
+  history.push({ ts: Date.now(), bytes: new Uint8Array(bytes) });
+  const oldestAllowed = Date.now() - 7000;
+  while (history.length > 0 && history[0].ts < oldestAllowed) {
+    history.shift();
+  }
+}
+
+function mergePcmHistoryToBlob(history, windowMs, sampleRate = 16000) {
+  const cutoff = Date.now() - windowMs;
+  const selected = history.filter((h) => h.ts >= cutoff).map((h) => h.bytes);
+  if (selected.length === 0) return null;
+  const totalLen = selected.reduce((sum, arr) => sum + arr.length, 0);
+  const merged = new Uint8Array(totalLen);
+  let off = 0;
+  for (const arr of selected) {
+    merged.set(arr, off);
+    off += arr.length;
+  }
+  const b64 = bytesToBase64(merged);
+  return pcm16ChunkToWavBlob(b64, sampleRate, 1, 2);
+}
 
 function selectedPlatform() {
   return String((platformSelect && platformSelect.value) || 'teams').toLowerCase();
@@ -117,6 +145,146 @@ function appendTranscriptLine(text, cssClass = '') {
 
 function clearTranscript() {
   transcriptBox.innerHTML = '';
+  transcriptPairsById.clear();
+  outgoingPcmHistory.length = 0;
+  incomingPcmHistory.length = 0;
+}
+
+function ensurePairEntry(segmentId, incoming) {
+  const key = String(segmentId || `seg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
+  if (transcriptPairsById.has(key)) return transcriptPairsById.get(key);
+  const card = document.createElement('div');
+  card.className = 'pair-card';
+
+  const title = document.createElement('div');
+  title.className = 'pair-title';
+  title.textContent = incoming ? `Other Person (segment ${key})` : `You (segment ${key})`;
+
+  const grid = document.createElement('div');
+  grid.className = 'pair-grid';
+
+  const realCell = document.createElement('div');
+  realCell.className = 'pair-cell';
+  const realLabel = document.createElement('div');
+  realLabel.className = 'pair-label';
+  realLabel.textContent = incoming ? 'Real speech (other person)' : 'Real speech (you)';
+  const realText = document.createElement('div');
+  realText.className = 'pair-text';
+  realText.textContent = '...';
+  const realPlayBtn = document.createElement('button');
+  realPlayBtn.className = 'pair-play-btn';
+  realPlayBtn.textContent = 'Play real';
+  realPlayBtn.disabled = true;
+  realCell.appendChild(realLabel);
+  realCell.appendChild(realText);
+  realCell.appendChild(realPlayBtn);
+
+  const translatedCell = document.createElement('div');
+  translatedCell.className = 'pair-cell';
+  const translatedLabel = document.createElement('div');
+  translatedLabel.className = 'pair-label';
+  translatedLabel.textContent = incoming ? 'AI translated to you' : 'AI translated to other side';
+  const translatedText = document.createElement('div');
+  translatedText.className = 'pair-text';
+  translatedText.textContent = '...';
+  const translatedPlayBtn = document.createElement('button');
+  translatedPlayBtn.className = 'pair-play-btn';
+  translatedPlayBtn.textContent = 'Play translated';
+  translatedPlayBtn.disabled = true;
+  translatedCell.appendChild(translatedLabel);
+  translatedCell.appendChild(translatedText);
+  translatedCell.appendChild(translatedPlayBtn);
+
+  grid.appendChild(realCell);
+  grid.appendChild(translatedCell);
+  card.appendChild(title);
+  card.appendChild(grid);
+  transcriptBox.appendChild(card);
+  transcriptBox.scrollTop = transcriptBox.scrollHeight;
+
+  const entry = {
+    key,
+    incoming,
+    title,
+    realText,
+    translatedText,
+    realPlayBtn,
+    translatedPlayBtn,
+    realAudioBlob: null,
+    translatedAudioBlob: null,
+    translatedChunkBytes: [],
+    translatedChunkMeta: { sampleRate: 16000, numChannels: 1, sampleWidth: 2 },
+  };
+  realPlayBtn.addEventListener('click', () => {
+    if (!entry.realAudioBlob) return;
+    enqueueScheduledTtsPlayback(entry.realAudioBlob, 'local');
+  });
+  translatedPlayBtn.addEventListener('click', () => {
+    if (!entry.translatedAudioBlob) return;
+    enqueueScheduledTtsPlayback(entry.translatedAudioBlob, 'local');
+  });
+  transcriptPairsById.set(key, entry);
+  return entry;
+}
+
+function setPairRealAudio(entry, blob) {
+  if (!entry || !blob) return;
+  entry.realAudioBlob = blob;
+  if (entry.realPlayBtn) entry.realPlayBtn.disabled = false;
+}
+
+function setPairTranslatedAudio(entry, blob) {
+  if (!entry || !blob) return;
+  entry.translatedAudioBlob = blob;
+  if (entry.translatedPlayBtn) entry.translatedPlayBtn.disabled = false;
+}
+
+function pushPairTranslatedChunk(entry, payload) {
+  if (!entry || !payload) return;
+  const bytes = base64ToBytes(payload.audioBase64 || '');
+  if (!bytes.length) return;
+  entry.translatedChunkBytes.push(bytes);
+  entry.translatedChunkMeta = {
+    sampleRate: payload.sampleRate || 16000,
+    numChannels: payload.numChannels || 1,
+    sampleWidth: payload.sampleWidth || 2,
+  };
+}
+
+function finalizePairTranslatedChunks(entry) {
+  if (!entry || entry.translatedChunkBytes.length === 0) return;
+  const totalLen = entry.translatedChunkBytes.reduce((sum, arr) => sum + arr.length, 0);
+  const merged = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const arr of entry.translatedChunkBytes) {
+    merged.set(arr, offset);
+    offset += arr.length;
+  }
+  entry.translatedChunkBytes = [];
+  const base64Merged = bytesToBase64(merged);
+  const blob = pcm16ChunkToWavBlob(
+    base64Merged,
+    entry.translatedChunkMeta.sampleRate || 16000,
+    entry.translatedChunkMeta.numChannels || 1,
+    entry.translatedChunkMeta.sampleWidth || 2
+  );
+  setPairTranslatedAudio(entry, blob);
+}
+
+function appendTranscriptPair(payload) {
+  const incoming = Boolean(payload && payload.incoming);
+  const segmentId = payload && payload.segmentId ? payload.segmentId : '';
+  const entry = ensurePairEntry(segmentId, incoming);
+  if (payload.translated) {
+    entry.translatedText.textContent = String(payload.text || '').trim() || '...';
+  } else {
+    entry.realText.textContent = String(payload.text || '').trim() || '...';
+    const realClip = incoming
+      ? mergePcmHistoryToBlob(incomingPcmHistory, INCOMING_CLIP_WINDOW_MS, TARGET_SAMPLE_RATE)
+      : mergePcmHistoryToBlob(outgoingPcmHistory, OUTGOING_CLIP_WINDOW_MS, TARGET_SAMPLE_RATE);
+    if (realClip) setPairRealAudio(entry, realClip);
+  }
+  transcriptBox.scrollTop = transcriptBox.scrollHeight;
 }
 
 function buildLanguageOptions() {
@@ -233,6 +401,7 @@ function sendPCMToSTT(newPCM) {
     const frame = pcmBuffer.slice(0, 512);
     pcmBuffer = pcmBuffer.slice(512);
     const bytes = new Uint8Array(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength));
+    pushPcmHistory(outgoingPcmHistory, bytes);
     sttFrameQueue.push(bytes);
   }
 }
@@ -243,6 +412,7 @@ function sendPCMToSTTReturn(newPCM) {
     const frame = returnPcmBuffer.slice(0, 512);
     returnPcmBuffer = returnPcmBuffer.slice(512);
     const bytes = new Uint8Array(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength));
+    pushPcmHistory(incomingPcmHistory, bytes);
     returnSttFrameQueue.push(bytes);
   }
 }
@@ -1113,29 +1283,26 @@ if (window.electronAPI.onGenesysBridgeStatus) {
 }
 
 window.electronAPI.onTranscript((payload) => {
-  const spk = payload.speakerId ? ` [${payload.speakerId}]` : '';
-  if (payload.incoming) {
-    if (payload.translated) {
-      appendTranscriptLine(`You hear (source)${spk}: ${payload.text}`, 'line-muted');
-    } else {
-      appendTranscriptLine(`Team (target)${spk}: ${payload.text}`);
-    }
-    return;
-  }
-  if (payload.translated) {
-    appendTranscriptLine(`Translated${spk}: ${payload.text}`);
-  } else {
-    appendTranscriptLine(`Source${spk}: ${payload.text}`);
-  }
+  if (!payload || typeof payload !== 'object') return;
+  appendTranscriptPair(payload);
 });
 
 window.electronAPI.onTranslatedAudio((payload) => {
+  if (payload && payload.segmentId) {
+    const entry = ensurePairEntry(payload.segmentId, (payload.channel || 'meeting') === 'local');
+    const segmentBlob = base64ToBlob(payload.audioBase64, payload.mimeType);
+    setPairTranslatedAudio(entry, segmentBlob);
+  }
   const blob = base64ToBlob(payload.audioBase64, payload.mimeType);
   const channel = payload.channel || 'meeting';
   enqueueScheduledTtsPlayback(blob, channel);
 });
 
 window.electronAPI.onTranslatedAudioChunk((payload) => {
+  if (payload && payload.segmentId) {
+    const entry = ensurePairEntry(payload.segmentId, (payload.channel || 'meeting') === 'local');
+    pushPairTranslatedChunk(entry, payload);
+  }
   const bytes = base64ToBytes(payload.audioBase64);
   ttsChunkMeta = {
     sampleRate: payload.sampleRate || 16000,
@@ -1148,6 +1315,10 @@ window.electronAPI.onTranslatedAudioChunk((payload) => {
 });
 
 window.electronAPI.onTranslatedAudioDone((payload) => {
+  if (payload && payload.segmentId) {
+    const entry = ensurePairEntry(payload.segmentId, (payload.channel || 'meeting') === 'local');
+    finalizePairTranslatedChunks(entry);
+  }
   if (payload && payload.channel) {
     ttsChunkMeta = { ...ttsChunkMeta, channel: payload.channel };
   }

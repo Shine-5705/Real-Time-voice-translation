@@ -11,6 +11,7 @@ function createTranscriptQueueService({
   enqueueTtsJob,
   writeEvent,
   appendTranslatedLine,
+  appendConversationPair,
 }) {
   let queueProcessing = false;
   const transcriptQueue = [];
@@ -27,6 +28,7 @@ function createTranscriptQueueService({
           const isIncoming = item.direction === 'in';
           logInfo(isIncoming ? `STT-IN(${item.detectedLanguage}, ${item.latency}): ${item.text}` : `STT(${item.detectedLanguage}, ${item.latency}): ${item.text}`);
           event.sender.send('transcript', {
+            segmentId: item.id,
             text: item.text,
             detectedLanguage: item.detectedLanguage,
             latency: item.latency,
@@ -60,6 +62,14 @@ function createTranscriptQueueService({
           if (!translatedText || !translatedText.trim()) continue;
           logInfo(isIncoming ? `TRANSLATED-IN(${sourceLanguage} -> ${targetLanguage}): ${translatedText}` : `TRANSLATED(${sourceLanguage} -> ${targetLanguage}): ${translatedText}`);
           appendTranslatedLine(item.id, isIncoming, sourceLanguage, targetLanguage, translatedText);
+          if (typeof appendConversationPair === 'function') {
+            appendConversationPair({
+              segmentId: item.id,
+              direction: isIncoming ? 'incoming' : 'outgoing',
+              sourceText: item.text,
+              translatedText,
+            });
+          }
           writeEvent('segment_translated', {
             segment_id: item.id,
             source_language: sourceLanguage,
@@ -70,6 +80,7 @@ function createTranscriptQueueService({
           });
 
           event.sender.send('transcript', {
+            segmentId: item.id,
             text: translatedText,
             translated: true,
             sourceText: item.text,

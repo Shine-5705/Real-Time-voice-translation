@@ -247,6 +247,7 @@ function createTtsService({
             emittedChunkCount += 1;
             totalPcmBytes += pcmChunk.length;
             event.sender.send('translated-audio-chunk', {
+              segmentId: segmentId || undefined,
               audioBase64: pcmChunk.toString('base64'),
               sampleRate,
               numChannels: 1,
@@ -255,6 +256,7 @@ function createTtsService({
             });
             if (typeof hooks.onChunk === 'function') {
               hooks.onChunk({
+                segmentId: segmentId || undefined,
                 audioBase64: pcmChunk.toString('base64'),
                 sampleRate,
                 numChannels: 1,
@@ -267,12 +269,14 @@ function createTtsService({
         totalBytes += audioBuffer.length;
         if (before === emittedChunkCount) {
           event.sender.send('translated-audio', {
+            segmentId: segmentId || undefined,
             mimeType: 'audio/wav',
             audioBase64: audioBuffer.toString('base64'),
             channel: playbackChannel,
           });
           if (typeof hooks.onAudio === 'function') {
             hooks.onAudio({
+              segmentId: segmentId || undefined,
               mimeType: 'audio/wav',
               audioBase64: audioBuffer.toString('base64'),
               channel: playbackChannel,
@@ -283,12 +287,14 @@ function createTtsService({
         const audioBuffer = await synthesizeTTS(parts[i], ttsLangCode, {});
         totalBytes += audioBuffer.length;
         event.sender.send('translated-audio', {
+          segmentId: segmentId || undefined,
           mimeType: 'audio/wav',
           audioBase64: audioBuffer.toString('base64'),
           channel: playbackChannel,
         });
         if (typeof hooks.onAudio === 'function') {
           hooks.onAudio({
+            segmentId: segmentId || undefined,
             mimeType: 'audio/wav',
             audioBase64: audioBuffer.toString('base64'),
             channel: playbackChannel,

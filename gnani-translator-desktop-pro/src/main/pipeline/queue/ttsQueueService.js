@@ -64,6 +64,7 @@ function createTtsQueueService({
               voice,
               onChunk: (chunk) => {
                 const payload = {
+                  segmentId,
                   audioBase64: chunk.toString('base64'),
                   sampleRate,
                   numChannels: Number(env('VACHANA_TTS_NUM_CHANNELS', '1')),

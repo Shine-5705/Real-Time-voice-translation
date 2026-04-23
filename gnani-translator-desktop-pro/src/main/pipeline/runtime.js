@@ -75,6 +75,19 @@ function buildUrl(endpoint) {
   return `${baseUrl}${endpoint}`;
 }
 
+function extractPcmFromWavBuffer(wavBuffer) {
+  if (!Buffer.isBuffer(wavBuffer) || wavBuffer.length < 44) return Buffer.alloc(0);
+  const riff = wavBuffer.toString('ascii', 0, 4);
+  const wave = wavBuffer.toString('ascii', 8, 12);
+  if (riff !== 'RIFF' || wave !== 'WAVE') return Buffer.alloc(0);
+  const dataId = wavBuffer.toString('ascii', 36, 40);
+  if (dataId !== 'data') return Buffer.alloc(0);
+  const dataSize = wavBuffer.readUInt32LE(40);
+  const end = Math.min(wavBuffer.length, 44 + dataSize);
+  if (end <= 44) return Buffer.alloc(0);
+  return wavBuffer.subarray(44, end);
+}
+
 function bootRuntime({ app, createMainWindow }) {
   app.commandLine.appendSwitch('enable-logging');
 
@@ -239,11 +252,31 @@ function bootRuntime({ app, createMainWindow }) {
     sendStatus,
     getState,
     onTtsChunk: (chunkPayload) => {
+      const chunkBytes = Buffer.from(String(chunkPayload.audioBase64 || ''), 'base64');
+      const sr = Number(chunkPayload.sampleRate || 16000);
+      const channel = String(chunkPayload.channel || 'meeting');
+      artifacts.appendAudioTrack(
+        channel === 'local' ? 'incomingTranslated' : 'outgoingTranslated',
+        chunkBytes,
+        sr
+      );
+      artifacts.appendAudioTrack('fullTranslatedConversation', chunkBytes, sr);
       if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
         genesysBridgeService.publishTtsChunk(chunkPayload);
       }
     },
     onTtsAudio: (audioPayload) => {
+      const wavBytes = Buffer.from(String(audioPayload.audioBase64 || ''), 'base64');
+      const pcmBytes = extractPcmFromWavBuffer(wavBytes);
+      const channel = String(audioPayload.channel || 'meeting');
+      if (pcmBytes.length) {
+        artifacts.appendAudioTrack(
+          channel === 'local' ? 'incomingTranslated' : 'outgoingTranslated',
+          pcmBytes,
+          Number(env('GOOGLE_TTS_SAMPLE_RATE', '16000'))
+        );
+        artifacts.appendAudioTrack('fullTranslatedConversation', pcmBytes, Number(env('GOOGLE_TTS_SAMPLE_RATE', '16000')));
+      }
       if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
         genesysBridgeService.publishTtsAudio(audioPayload);
       }
@@ -268,6 +301,7 @@ function bootRuntime({ app, createMainWindow }) {
     enqueueTtsJob: ttsQueue.enqueueTtsJob,
     writeEvent: artifacts.writeEvent,
     appendTranslatedLine,
+    appendConversationPair: artifacts.appendConversationPair,
   });
 
   function enqueueTranscript(event, msg) {
@@ -494,6 +528,8 @@ function bootRuntime({ app, createMainWindow }) {
       if (!state.translationRunning || !chunkBytes) return;
       const buffer = Buffer.isBuffer(chunkBytes) ? chunkBytes : Buffer.from(chunkBytes);
       if (buffer.length !== 1024) return;
+      artifacts.appendAudioTrack('outgoingReal', buffer, 16000);
+      artifacts.appendAudioTrack('fullRealConversation', buffer, 16000);
       if (state.sttMode === 'rest') {
         state.restAudioBuffer.push(buffer);
         return;
@@ -506,6 +542,8 @@ function bootRuntime({ app, createMainWindow }) {
       if (!state.translationRunning || !state.activeConfig?.bidirectional || !chunkBytes) return;
       const buffer = Buffer.isBuffer(chunkBytes) ? chunkBytes : Buffer.from(chunkBytes);
       if (buffer.length !== 1024) return;
+      artifacts.appendAudioTrack('incomingReal', buffer, 16000);
+      artifacts.appendAudioTrack('fullRealConversation', buffer, 16000);
       if (state.sttMode === 'rest') {
         state.restAudioBufferReturn.push(buffer);
         return;
