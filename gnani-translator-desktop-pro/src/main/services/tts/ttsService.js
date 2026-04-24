@@ -32,14 +32,14 @@ function createTtsService({
     const defaults = {
       hi: 'hi-IN-Chirp3-HD-Aoede',
       en: 'en-US-Chirp3-HD-Aoede',
-      bn: 'bn-IN-Wavenet-A',
-      gu: 'gu-IN-Wavenet-A',
-      kn: 'kn-IN-Wavenet-A',
-      ml: 'ml-IN-Wavenet-A',
-      mr: 'mr-IN-Wavenet-A',
-      pa: 'pa-IN-Wavenet-A',
-      ta: 'ta-IN-Neural2-A',
-      te: 'te-IN-Standard-A',
+      bn: 'bn-IN-Chirp3-HD-Aoede',
+      gu: 'gu-IN-Chirp3-HD-Aoede',
+      kn: 'kn-IN-Chirp3-HD-Aoede',
+      ml: 'ml-IN-Chirp3-HD-Aoede',
+      mr: 'mr-IN-Chirp3-HD-Aoede',
+      pa: 'pa-IN-Chirp3-HD-Aoede',
+      ta: 'ta-IN-Chirp3-HD-Aoede',
+      te: 'te-IN-Chirp3-HD-Aoede',
     };
     return defaults[lc] || env('GOOGLE_TTS_VOICE', 'en-US-Chirp3-HD-Aoede');
   }

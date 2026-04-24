@@ -75,6 +75,8 @@ const MIC_ADAPTIVE_HANGOVER_FRAMES = 4;
 const MIC_ADAPTIVE_FLOOR_LEAK = 0.04;
 const FULL_DUPLEX_OVERLAP_CAPTURE = true;
 const OVERLAP_ATTENUATION_GAIN = 0.35;
+const FORWARD_MIN_SEND_RMS = 0.006;
+const RETURN_MIN_SEND_RMS = 0.008;
 let adaptiveNoiseFloor = 0.002;
 let adaptiveHangoverLeft = 0;
 const MIC_HIGHPASS_HZ = 120;
@@ -963,6 +965,10 @@ async function startListenPipeline(listenDeviceId) {
       // In overlap conversations, attenuate instead of dropping so both sides are still transcribed.
       boosted = applyGain(boosted, OVERLAP_ATTENUATION_GAIN);
     }
+    if (computeRms(boosted) < RETURN_MIN_SEND_RMS) {
+      returnGatedFrames += 1;
+      return;
+    }
     sendPCMToSTTReturn(toInt16(boosted));
   };
 
@@ -1044,6 +1050,10 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
     if (FULL_DUPLEX_OVERLAP_CAPTURE && now < localTtsGateUntil) {
       // Preserve near-simultaneous turn-taking by reducing level instead of hard gate.
       boosted = applyGain(boosted, OVERLAP_ATTENUATION_GAIN);
+    }
+    if (computeRms(boosted) < FORWARD_MIN_SEND_RMS) {
+      fwdGatedFrames += 1;
+      return;
     }
     emitMicTelemetry(boosted);
 

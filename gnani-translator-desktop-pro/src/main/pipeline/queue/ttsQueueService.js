@@ -13,21 +13,36 @@ function createTtsQueueService({
   onTtsAudio,
   onTtsDone,
 }) {
-  const ttsJobQueue = [];
-  let ttsWorkerActive = false;
+  const meetingQueue = [];
+  const localQueue = [];
+  let meetingWorkerActive = false;
+  let localWorkerActive = false;
 
   function enqueueTtsJob(job) {
-    ttsJobQueue.push(job);
-    processTtsJobQueue().catch((error) => {
-      logError(`TTS QUEUE ERROR: ${error.message}`);
+    const channel = String(job?.playbackChannel || 'meeting').toLowerCase() === 'local' ? 'local' : 'meeting';
+    if (channel === 'local') {
+      localQueue.push(job);
+      processTtsJobQueue('local').catch((error) => {
+        logError(`TTS QUEUE ERROR(local): ${error.message}`);
+      });
+      return;
+    }
+    meetingQueue.push(job);
+    processTtsJobQueue('meeting').catch((error) => {
+      logError(`TTS QUEUE ERROR(meeting): ${error.message}`);
     });
   }
 
-  async function processTtsJobQueue() {
-    if (ttsWorkerActive) return;
-    ttsWorkerActive = true;
-    while (ttsJobQueue.length > 0) {
-      const job = ttsJobQueue.shift();
+  async function processTtsJobQueue(channel = 'meeting') {
+    const isLocal = channel === 'local';
+    const queue = isLocal ? localQueue : meetingQueue;
+    if (isLocal ? localWorkerActive : meetingWorkerActive) return;
+    if (queue.length === 0) return;
+    if (isLocal) localWorkerActive = true;
+    else meetingWorkerActive = true;
+
+    while (queue.length > 0) {
+      const job = queue.shift();
       const {
         segmentId,
         translatedText,
@@ -159,13 +174,19 @@ function createTtsQueueService({
         sendStatus(event, getState().translationRunning, `Pipeline error: ${error.message}`);
       }
     }
-    ttsWorkerActive = false;
+    if (isLocal) localWorkerActive = false;
+    else meetingWorkerActive = false;
+    if (queue.length > 0) {
+      processTtsJobQueue(channel).catch((error) => {
+        logError(`TTS QUEUE ERROR(${channel}): ${error.message}`);
+      });
+    }
   }
 
   return {
     enqueueTtsJob,
     processTtsJobQueue,
-    getQueue: () => ttsJobQueue,
+    getQueue: () => [...meetingQueue, ...localQueue],
   };
 }
 
