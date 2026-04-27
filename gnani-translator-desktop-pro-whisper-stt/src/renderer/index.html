@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Gnani Translator</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; padding: 30px; background: #f8f9fa; }
+    h1 { color: #0066cc; }
+    button { padding: 14px 28px; font-size: 18px; margin: 15px; border: none; border-radius: 8px; cursor: pointer; }
+    #startBtn { background: #28a745; color: white; }
+    #stopBtn { background: #dc3545; color: white; }
+    #status { margin: 20px; font-size: 17px; min-height: 24px; }
+    select { padding: 10px; width: 80%; margin: 10px; font-size: 16px; }
+    #transcriptBox {
+      width: 80%;
+      margin: 16px auto;
+      text-align: left;
+      background: #ffffff;
+      border: 1px solid #d8dce3;
+      border-radius: 8px;
+      padding: 10px;
+      min-height: 92px;
+      max-height: 170px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .line-muted { color: #666; }
+    .pair-card {
+      border: 1px solid #e3e8ef;
+      border-radius: 8px;
+      padding: 8px;
+      margin-bottom: 8px;
+      background: #fcfdff;
+    }
+    .pair-title {
+      font-size: 11px;
+      color: #5b6470;
+      margin-bottom: 6px;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+    }
+    .pair-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .pair-cell {
+      border: 1px solid #eef2f6;
+      border-radius: 6px;
+      padding: 6px;
+      background: #fff;
+    }
+    .pair-label {
+      font-size: 11px;
+      color: #637083;
+      margin-bottom: 4px;
+    }
+    .pair-text {
+      font-size: 13px;
+      color: #1f2937;
+      min-height: 18px;
+      word-break: break-word;
+    }
+    .pair-play-btn {
+      margin-top: 6px;
+      padding: 4px 8px;
+      border: 1px solid #cfd7e3;
+      border-radius: 5px;
+      background: #f7f9fc;
+      color: #1f2937;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .pair-play-btn[disabled] {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .tab-strip {
+      width: 80%;
+      margin: 8px auto 16px auto;
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      margin: 0;
+      padding: 8px 14px;
+      font-size: 14px;
+      border: 1px solid #cfd7e3;
+      border-radius: 999px;
+      background: #f4f6fa;
+      color: #2a3340;
+    }
+    .tab-btn.active {
+      background: #0d6efd;
+      color: #fff;
+      border-color: #0d6efd;
+    }
+    .mode-hidden {
+      display: none !important;
+    }
+    .stt-insights {
+      width: 80%;
+      margin: 8px auto;
+      text-align: left;
+      font-size: 13px;
+      color: #475569;
+      background: #fff;
+      border: 1px solid #d8dce3;
+      border-radius: 8px;
+      padding: 8px 10px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <h1>Gnani Translator</h1>
+  <p>Realtime Voice Translation</p>
+
+  <div class="tab-strip">
+    <button id="translatorTabBtn" class="tab-btn active">Gnani Translation</button>
+    <button id="sttTabBtn" class="tab-btn">Whisper STT (Only)</button>
+  </div>
+
+  <button id="startBtn">Start Translation</button>
+  <button id="stopBtn" disabled>Stop Translation</button>
+
+  <div id="status">Status: Ready (Install virtual cable first)</div>
+
+  <h3>Input Microphone:</h3>
+  <select id="micSelect"><option>Loading devices...</option></select>
+
+  <div id="outputSection">
+    <h3>Output Device (route to virtual cable):</h3>
+    <select id="outputSelect"><option>Loading devices...</option></select>
+  </div>
+
+  <div id="platformSection">
+    <h3>Platform Profile:</h3>
+    <select id="platformSelect">
+      <option value="teams">Microsoft Teams/Meet (existing)</option>
+      <option value="genesys">Genesys Cloud CX</option>
+    </select>
+  </div>
+
+  <div id="deliverySection">
+    <h3>Delivery Mode:</h3>
+    <select id="deliveryModeSelect">
+      <option value="assist">Assist only (agent-side translation)</option>
+      <option value="inject">Inject only (Genesys bridge)</option>
+      <option value="both">Assist + Inject</option>
+    </select>
+  </div>
+
+  <div id="bidirectionalSection" style="width: 80%; margin: 10px auto; text-align: left;">
+    <label style="font-size: 14px; cursor: pointer;">
+      <input type="checkbox" id="bidirectionalToggle">
+      Enable Bidirectional (hear the other person in your language)
+    </label>
+    <div id="bidirectionalOpts" style="display: none; margin-top: 8px;">
+      <label style="font-size: 13px;">Loopback Input (meeting audio — e.g. BlackHole 2ch):</label>
+      <select id="listenSelect" style="width: 100%; margin: 4px 0;"><option value="">-- Select loopback device --</option></select>
+      <label style="font-size: 13px;">Your Headphones/Speakers (for hearing translations):</label>
+      <select id="localOutputSelect" style="width: 100%; margin: 4px 0;"><option value="">-- Select headphones --</option></select>
+      <p style="font-size: 11px; color: #888; margin: 4px 0 0 0;">
+        Loopback = the device Teams sends audio to (a 2nd virtual cable). Your headphones = where you hear the other person's translated speech.
+      </p>
+    </div>
+  </div>
+
+  <h3>Source Language:</h3>
+  <select id="sourceLang"></select>
+
+  <div id="targetSection">
+    <h3>Target Language:</h3>
+    <select id="targetLang"></select>
+  </div>
+
+  <div id="voiceCloneSection" style="width: 80%; margin: 12px auto; text-align: left;">
+    <h3 style="margin-bottom: 6px;">Voice Cloning:</h3>
+    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+      <button id="enrollVoiceBtn" style="padding: 8px 18px; font-size: 14px; background: #6f42c1; color: white; border: none; border-radius: 6px; cursor: pointer;">
+        Enroll My Voice
+      </button>
+      <span id="enrollStatus" style="font-size: 13px; color: #666;">Not enrolled — TTS will use default voice</span>
+    </div>
+    <p style="font-size: 12px; color: #888; margin: 4px 0 0 0;">
+      Records ~10 seconds of your mic. Speak naturally. Your translated speech will sound like you.
+    </p>
+  </div>
+
+  <p id="passthroughSection" style="font-size: 13px; margin: 8px 0 0 0; text-align: left; width: 80%; margin-left: auto; margin-right: auto;">
+    <label>
+      <input type="checkbox" id="passthroughToggle">
+      Mic passthrough to VB-CABLE (disabled in target-only mode)
+    </label>
+  </p>
+  <p style="font-size: 13px; margin: 8px 0 0 0; text-align: left; width: 80%; margin-left: auto; margin-right: auto;">
+    <label title="Like vachana diarization: keep only the first detected speaker and drop others (needs speaker_id from STT).">
+      <input type="checkbox" id="guestSpeakerToggle">
+      Single-speaker (guest) mode — lock to first voice; ignore other speakers &amp; crosstalk
+    </label>
+  </p>
+
+  <div id="transcriptBox">
+    <div class="line-muted">Transcript will appear here...</div>
+  </div>
+
+  <div id="sttInsights" class="stt-insights mode-hidden">
+    Segments: <span id="sttSegmentsCount">0</span> |
+    Avg STT latency: <span id="sttAvgLatency">n/a</span> |
+    Last STT latency: <span id="sttLastLatency">n/a</span>
+  </div>
+
+  <div id="sttTuningSection" class="stt-insights mode-hidden">
+    <strong>STT Tuning Preset:</strong>
+    <select id="audioPresetSelect" style="width: 100%; margin: 8px 0 4px 0;">
+      <option value="wispr_catch">Wispr-like Catching (recommended)</option>
+      <option value="noisy_room">Noisy Room (strong noise cancel)</option>
+      <option value="balanced">Balanced</option>
+    </select>
+    <div style="font-size: 12px; color: #64748b;">
+      Changes speech catching and noise filtering for the STT-only tab.
+    </div>
+    <label style="display: block; margin-top: 8px; font-size: 13px; color: #334155;">
+      <input type="checkbox" id="injectTypingToggle">
+      Inject final cleaned text into active app (macOS typing simulation)
+    </label>
+  </div>
+
+  <p style="font-size: 13px; color: #333; line-height: 1.5; text-align: left; margin-top: 16px;">
+    Teams/Genesys app-routing steps:<br>
+    1. Install VB-CABLE (Windows) or BlackHole (macOS).<br>
+    2. In this app, Input Microphone must be your physical mic (not CABLE Output).<br>
+    3. In this app, Output Device should be CABLE Input/BlackHole.<br>
+    4. Click Start Translation.<br>
+    5. In Teams/Genesys desktop client settings, set Microphone to CABLE Output/BlackHole and keep Speaker on your headset.
+  </p>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
