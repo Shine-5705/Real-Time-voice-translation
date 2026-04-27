@@ -1,4 +1,0 @@
-# For optional Electron TTS via Python (VACHANA_TTS_USE_PYTHON=true in repo .env)
-httpx>=0.27
-python-dotenv>=1.0
-certifi>=2024.0.0
