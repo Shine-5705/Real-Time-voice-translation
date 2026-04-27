@@ -18,6 +18,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTranscript: (callback) => {
     ipcRenderer.on('transcript', (_event, payload) => callback(payload));
   },
+  onTranscriptInterim: (callback) => {
+    ipcRenderer.on('transcript-interim', (_event, payload) => callback(payload));
+  },
   onTranslatedAudio: (callback) => {
     ipcRenderer.on('translated-audio', (_event, payload) => callback(payload));
   },

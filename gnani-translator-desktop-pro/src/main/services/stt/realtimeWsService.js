@@ -31,10 +31,13 @@ function createRealtimeWsSttService({
       socket.on('message', (payload, isBinary) => {
         if (isBinary) return;
         try {
-          const msg = JSON.parse(payload.toString());
+          const raw = payload.toString();
+          const msg = JSON.parse(raw);
           if (msg.type === 'connected') return sendStatus(event, true, 'Connected to STT. Speak now.');
           if (msg.type === 'processing') return sendStatus(event, true, 'Processing speech segment...');
           if (msg.type === 'error') return sendStatus(event, true, `STT error: ${msg.message}`);
+          // Log every non-status message from Vachana so we can debug transcript formats
+          logInfo(`[Vachana STT] msg type=${msg.type || 'none'} text="${String(msg.text || '').slice(0, 120)}" keys=${Object.keys(msg).join(',')}`);
           enqueueTranscript(event, msg);
         } catch (error) {
           sendStatus(event, getState().translationRunning, `Bad STT message: ${error.message}`);
@@ -76,6 +79,7 @@ function createRealtimeWsSttService({
           const msg = JSON.parse(payload.toString());
           if (msg.type === 'connected' || msg.type === 'processing') return;
           if (msg.type === 'error') return logError(`Return STT error: ${msg.message}`);
+          logInfo(`[Vachana STT return] msg type=${msg.type || 'none'} text="${String(msg.text || '').slice(0, 120)}" keys=${Object.keys(msg).join(',')}`);
           enqueueTranscriptIncoming(event, msg);
         } catch (error) {
           logError(`Bad return STT message: ${error.message}`);

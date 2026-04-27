@@ -84,7 +84,24 @@ let ttsChunkMeta = { sampleRate: 16000, numChannels: 1, sampleWidth: 2, channel:
 let ttsAggregateTimer = null;
 
 const LANGUAGES = [
+  ['ar-SA', 'Arabic'],
   ['bn-IN', 'Bengali'],
+  ['de-DE', 'German'],
+  ['es-ES', 'Spanish'],
+  ['fr-FR', 'French'],
+  ['it-IT', 'Italian'],
+  ['ja-JP', 'Japanese'],
+  ['ko-KR', 'Korean'],
+  ['nl-NL', 'Dutch'],
+  ['pl-PL', 'Polish'],
+  ['pt-BR', 'Portuguese (Brazil)'],
+  ['pt-PT', 'Portuguese (Portugal)'],
+  ['ru-RU', 'Russian'],
+  ['tr-TR', 'Turkish'],
+  ['uk-UA', 'Ukrainian'],
+  ['vi-VN', 'Vietnamese'],
+  ['zh-CN', 'Chinese (Simplified)'],
+  ['zh-TW', 'Chinese (Traditional)'],
   ['en-IN', 'English'],
   ['gu-IN', 'Gujarati'],
   ['hi-IN', 'Hindi'],
@@ -445,13 +462,13 @@ function emitMicTelemetry(floatArray) {
 
 function startPacedSttSender() {
   stopPacedSttSender();
-  // Vachana STT requires steady 32ms frames (512 samples @16kHz => 1024 bytes).
+  // Flush all queued frames each tick to minimise IPC overhead while
+  // maintaining the 32ms real-time cadence.
   sttSendTimer = setInterval(() => {
-    if (sttFrameQueue.length === 0) {
-      return;
+    if (sttFrameQueue.length === 0) return;
+    while (sttFrameQueue.length > 0) {
+      window.electronAPI.sendAudioChunk(sttFrameQueue.shift());
     }
-    const frame = sttFrameQueue.shift();
-    window.electronAPI.sendAudioChunk(frame);
   }, 32);
 }
 
@@ -466,12 +483,12 @@ function stopPacedSttSender() {
 function startPacedReturnSttSender() {
   stopPacedReturnSttSender();
   returnSttSendTimer = setInterval(() => {
-    if (returnSttFrameQueue.length === 0) {
-      return;
-    }
-    const frame = returnSttFrameQueue.shift();
-    if (window.electronAPI.sendAudioChunkReturn) {
-      window.electronAPI.sendAudioChunkReturn(frame);
+    if (returnSttFrameQueue.length === 0) return;
+    while (returnSttFrameQueue.length > 0) {
+      const frame = returnSttFrameQueue.shift();
+      if (window.electronAPI.sendAudioChunkReturn) {
+        window.electronAPI.sendAudioChunkReturn(frame);
+      }
     }
   }, 32);
 }
@@ -1286,6 +1303,37 @@ window.electronAPI.onTranscript((payload) => {
   if (!payload || typeof payload !== 'object') return;
   appendTranscriptPair(payload);
 });
+
+let interimBanner = null;
+function getInterimBanner() {
+  if (!interimBanner) {
+    interimBanner = document.createElement('div');
+    interimBanner.id = 'interimBanner';
+    interimBanner.style.cssText =
+      'padding:6px 12px;background:#fff3cd;color:#856404;border-radius:6px;' +
+      'font-style:italic;margin:4px 0;font-size:0.92em;min-height:1.4em;' +
+      'transition:opacity 0.15s;opacity:0;display:none;';
+    transcriptBox.appendChild(interimBanner);
+  }
+  return interimBanner;
+}
+
+if (window.electronAPI.onTranscriptInterim) {
+  window.electronAPI.onTranscriptInterim((payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const banner = getInterimBanner();
+    if (payload.final || !payload.text) {
+      banner.style.opacity = '0';
+      setTimeout(() => { banner.style.display = 'none'; }, 160);
+      return;
+    }
+    const prefix = payload.incoming ? 'Other person' : 'You';
+    banner.textContent = `${prefix} (live): ${payload.text}`;
+    banner.style.display = 'block';
+    banner.style.opacity = '1';
+    transcriptBox.scrollTop = transcriptBox.scrollHeight;
+  });
+}
 
 window.electronAPI.onTranslatedAudio((payload) => {
   if (payload && payload.segmentId) {

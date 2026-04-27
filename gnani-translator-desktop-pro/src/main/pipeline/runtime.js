@@ -1,26 +1,72 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║              Real-Time Call Translation – Pipeline Runtime                  ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                            ║
+ * ║  CUSTOMER PIPELINE  (Phone → Agent)                                        ║
+ * ║  ──────────────────────────────────                                        ║
+ * ║  Phone → Genesys → Blackhole 16ch → [STT] → [Translate] → [TTS] → Agent   ║
+ * ║                                                                            ║
+ * ║  AGENT PIPELINE  (Agent → Phone)                                           ║
+ * ║  ──────────────────────────────────                                        ║
+ * ║  Agent Mic → [STT] → [Translate] → [TTS] → Blackhole 2ch → Genesys → Phone║
+ * ║                                                                            ║
+ * ║  Pluggable components (via .env):                                          ║
+ * ║    STT_PROVIDER          = auto | google | deepgram | vachana              ║
+ * ║    VACHANA_STT_MODE      = ws     | rest                                   ║
+ * ║    TRANSLATION_PROVIDER  = google | vachana                                ║
+ * ║    TTS_PROVIDER          = google | vachana                                ║
+ * ║    ENABLE_TTS_REALTIME_WS = true  | false  (vachana WS TTS)               ║
+ * ║                                                                            ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
+
 const fs = require('fs');
 const path = require('path');
 const { ipcMain } = require('electron');
 const { env } = require('../config/env');
 const { logInfo, logError, nowISO } = require('../utils/logger');
+
+// ─── Google Cloud clients (lazy singletons) ──────────────────────────────────
 const { createGoogleClients } = require('../services/google/clients');
+
+// ─── Pluggable provider factories ────────────────────────────────────────────
+const { createSttProviderFactory } = require('../services/stt/sttProviderFactory');
+const { createTranslationProviderFactory } = require('../services/translation/translationProviderFactory');
+const { createTtsProviderFactory } = require('../services/tts/ttsProviderFactory');
+
+// ─── Underlying service implementations (used by factories) ──────────────────
 const { createTtsService } = require('../services/tts/ttsService');
 const { createTranslator } = require('../services/translation/translator');
 const { createTranscribeService } = require('../services/stt/transcribeService');
 const { createRealtimeWsSttService } = require('../services/stt/realtimeWsService');
+const { createGoogleStreamingSttService } = require('../services/stt/googleStreamingSttService');
+const { createDeepgramStreamingSttService } = require('../services/stt/deepgramStreamingSttService');
 const { createRestLoopSttService } = require('../services/stt/restLoopService');
+
+// ─── Shared services ─────────────────────────────────────────────────────────
 const { createArtifactService } = require('../services/artifacts/artifactService');
 const { createTranscriptQueueService } = require('./queue/transcriptQueueService');
 const { createTtsQueueService } = require('./queue/ttsQueueService');
+
+// ─── Genesys integration ─────────────────────────────────────────────────────
 const { createGenesysBridgeService } = require('../services/genesys/bridgeService');
 const { normalizeTranscriptMessage } = require('../services/genesys/mediaAdapter');
+
+// ─── Utilities ───────────────────────────────────────────────────────────────
 const {
+  isIndicLanguage,
+  sttProviderForLanguage,
   normalizeLangCode,
   toVachanaLanguageCode,
   sttRealtimeLangCode,
   candidateEndpoints,
   parseTranslationText,
 } = require('../services/common/pipelineUtils');
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ *  Helpers
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 function elapsedMs(startMs) {
   return Math.max(0, Date.now() - Number(startMs || Date.now()));
@@ -88,18 +134,35 @@ function extractPcmFromWavBuffer(wavBuffer) {
   return wavBuffer.subarray(44, end);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ *  Boot Runtime
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 function bootRuntime({ app, createMainWindow }) {
   app.commandLine.appendSwitch('enable-logging');
-
   const appDir = path.join(__dirname, '..', '..', '..');
+
+  /* ─── Shared pipeline state ─────────────────────────────────────────────── */
+
   const state = {
     mainWindow: null,
     translationRunning: false,
     activeConfig: null,
     activeSender: null,
+
+    // STT state (populated by providers at start-translation)
     sttMode: 'ws',
-    sttSocket: null,
-    sttSocketReturn: null,
+    // Legacy global provider (kept for REST-loop compat); prefer per-pipeline below
+    sttProvider: 'vachana',
+    // Per-pipeline providers — Customer and Agent may differ when STT_PROVIDER=auto
+    sttProviderCustomer: 'vachana',
+    sttProviderAgent: 'vachana',
+    sttSocket: null,           // Customer Pipeline: Vachana/Deepgram WS
+    sttSocketReturn: null,     // Agent Pipeline:    Vachana/Deepgram WS
+    sttGoogleStream: null,     // Customer Pipeline: Google streaming
+    sttGoogleStreamReturn: null, // Agent Pipeline:  Google streaming
+
+    // REST STT buffers
     restAudioBuffer: [],
     restInFlight: false,
     restOverlapBuffer: Buffer.alloc(0),
@@ -108,59 +171,73 @@ function bootRuntime({ app, createMainWindow }) {
     restInFlightReturn: false,
     restOverlapBufferReturn: Buffer.alloc(0),
     restFlushTimerReturn: null,
+
+    // Metrics
     metricsTimer: null,
+    audioFramesForwarded: 0,
+    audioFramesDropped: 0,
+
+    // Segment tracking
     segmentCounter: 0,
     lastEnqueuedTranscriptNorm: '',
     lastEnqueuedTranscriptNormIncoming: '',
+
+    // Translation context windows
     recentSourceContext: [],
     recentTargetContext: [],
     recentIncomingSourceContext: [],
     recentIncomingTargetContext: [],
+
+    // Voice clone
     voiceCloneEmbedding: null,
+
+    // Platform integration
     platform: 'teams',
     deliveryMode: 'assist',
   };
 
+  const getState = () => state;
+  const setState = (patch) => Object.assign(state, patch);
+
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  1. INITIALIZE UNDERLYING SERVICES
+   * ═════════════════════════════════════════════════════════════════════ */
+
   const googleClients = createGoogleClients({ env, appDir });
+
   const ttsService = createTtsService({
-    env,
-    logInfo,
-    logError,
-    elapsedMs,
-    fetchWithTimeout,
-    buildUrl,
-    candidateEndpoints,
+    env, logInfo, logError, elapsedMs, fetchWithTimeout, buildUrl, candidateEndpoints,
     getGoogleTtsClient: googleClients.getGoogleTtsClient,
     getGoogleTtsBetaClient: googleClients.getGoogleTtsBetaClient,
   });
+
   const translator = createTranslator({
-    env,
-    logInfo,
-    logError,
-    elapsedMs,
-    fetchWithTimeout,
-    buildUrl,
-    candidateEndpoints,
-    parseTranslationText,
-    normalizeLangCode,
+    env, logInfo, logError, elapsedMs, fetchWithTimeout, buildUrl, candidateEndpoints,
+    parseTranslationText, normalizeLangCode,
     getGoogleTranslateClient: googleClients.getGoogleTranslateClient,
   });
+
   const transcribeService = createTranscribeService({
-    env,
-    logInfo,
-    logError,
-    elapsedMs,
-    fetchWithTimeout,
-    buildUrl,
-    candidateEndpoints,
+    env, logInfo, logError, elapsedMs, fetchWithTimeout, buildUrl, candidateEndpoints,
     getGoogleSpeechClient: googleClients.getGoogleSpeechClient,
     toBcp47: ttsService.toBcp47,
   });
+
   const artifacts = createArtifactService({ env, nowISO, logInfo, logError });
 
-  const getState = () => state;
-  const setSockets = (patch) => Object.assign(state, patch);
-  const setState = (patch) => Object.assign(state, patch);
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  2. TRANSCRIPT ENQUEUE  (STT output → Translate → TTS queue)
+   *
+   *  Both pipelines converge here:
+   *    Customer Pipeline STT output → enqueueTranscript()
+   *    Agent Pipeline STT output    → enqueueTranscriptIncoming()
+   * ═════════════════════════════════════════════════════════════════════ */
+
+  function sendStatus(event, running, message) {
+    logInfo(`STATUS running=${running} :: ${message}`);
+    artifacts.writeEvent('status', { running, message });
+    event.sender.send('translation-status', { running, message });
+  }
 
   function appendContextText(direction, sourceText, translatedText) {
     const source = String(sourceText || '').trim();
@@ -201,113 +278,14 @@ function bootRuntime({ app, createMainWindow }) {
     );
   }
 
-  function sendStatus(event, running, message) {
-    logInfo(`STATUS running=${running} :: ${message}`);
-    artifacts.writeEvent('status', { running, message });
-    event.sender.send('translation-status', { running, message });
-  }
-
-  function broadcastGenesysBridgeStatus(payload) {
-    if (state.mainWindow && !state.mainWindow.isDestroyed()) {
-      state.mainWindow.webContents.send('genesys-bridge-status', payload);
-    }
-    if (state.activeSender && state.mainWindow && state.activeSender !== state.mainWindow.webContents) {
-      try {
-        state.activeSender.send('genesys-bridge-status', payload);
-      } catch (_err) {
-        // no-op
-      }
-    }
-  }
-
-  const genesysBridgeService = createGenesysBridgeService({
-    env,
-    logInfo,
-    logError,
-    normalizeTranscriptMessage,
-    onStatus: (payload) => {
-      artifacts.writeEvent('genesys_bridge_status', payload);
-      broadcastGenesysBridgeStatus(payload);
-    },
-    onTranscript: (transcriptPayload) => {
-      const bridgeEvent = { sender: state.mainWindow?.webContents || state.activeSender };
-      if (!bridgeEvent.sender) return;
-      if (String(transcriptPayload.direction || '').toLowerCase() === 'in') {
-        enqueueTranscriptIncoming(bridgeEvent, transcriptPayload);
-        return;
-      }
-      enqueueTranscript(bridgeEvent, transcriptPayload);
-    },
-  });
-
-  const ttsQueue = createTtsQueueService({
-    env,
-    logInfo,
-    logError,
-    elapsedMs,
-    synthesizeRestTtsSequentialToRenderer: ttsService.synthesizeRestTtsSequentialToRenderer,
-    streamTTSRealtime: ttsService.streamTTSRealtime,
-    writeEvent: artifacts.writeEvent,
-    writePipelineRow: artifacts.writePipelineRow,
-    sendStatus,
-    getState,
-    onTtsChunk: (chunkPayload) => {
-      const chunkBytes = Buffer.from(String(chunkPayload.audioBase64 || ''), 'base64');
-      const sr = Number(chunkPayload.sampleRate || 16000);
-      const channel = String(chunkPayload.channel || 'meeting');
-      artifacts.appendAudioTrack(
-        channel === 'local' ? 'incomingTranslated' : 'outgoingTranslated',
-        chunkBytes,
-        sr
-      );
-      artifacts.appendAudioTrack('fullTranslatedConversation', chunkBytes, sr);
-      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
-        genesysBridgeService.publishTtsChunk(chunkPayload);
-      }
-    },
-    onTtsAudio: (audioPayload) => {
-      const wavBytes = Buffer.from(String(audioPayload.audioBase64 || ''), 'base64');
-      const pcmBytes = extractPcmFromWavBuffer(wavBytes);
-      const channel = String(audioPayload.channel || 'meeting');
-      if (pcmBytes.length) {
-        artifacts.appendAudioTrack(
-          channel === 'local' ? 'incomingTranslated' : 'outgoingTranslated',
-          pcmBytes,
-          Number(env('GOOGLE_TTS_SAMPLE_RATE', '16000'))
-        );
-        artifacts.appendAudioTrack('fullTranslatedConversation', pcmBytes, Number(env('GOOGLE_TTS_SAMPLE_RATE', '16000')));
-      }
-      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
-        genesysBridgeService.publishTtsAudio(audioPayload);
-      }
-    },
-    onTtsDone: (donePayload) => {
-      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
-        genesysBridgeService.publishTtsDone(donePayload);
-      }
-    },
-  });
-
-  const transcriptQueue = createTranscriptQueueService({
-    env,
-    logInfo,
-    logError,
-    elapsedMs,
-    appendContextText,
-    getContextHint,
-    getContextHintReverse,
-    toVachanaLanguageCode,
-    translateText: translator.translateText,
-    enqueueTtsJob: ttsQueue.enqueueTtsJob,
-    writeEvent: artifacts.writeEvent,
-    appendTranslatedLine,
-    appendConversationPair: artifacts.appendConversationPair,
-  });
-
+  /**
+   * Customer Pipeline: enqueue transcript from customer's speech.
+   * Flow: Blackhole 16ch → STT → [here] → Translate → TTS → Agent
+   */
   function enqueueTranscript(event, msg) {
     if (!msg || msg.type !== 'transcript' || !msg.text || !msg.text.trim()) return;
     if (!isMeaningfulTranscript(msg.text)) {
-      logInfo(`STT noise skipped: "${String(msg.text).trim()}"`);
+      logInfo(`[CustomerPipeline] STT noise skipped: "${String(msg.text).trim()}"`);
       artifacts.writeEvent('segment_skipped_noise', { raw_text: String(msg.text).trim() });
       return;
     }
@@ -329,6 +307,10 @@ function bootRuntime({ app, createMainWindow }) {
     });
   }
 
+  /**
+   * Agent Pipeline: enqueue transcript from agent's speech.
+   * Flow: Agent Mic → STT → [here] → Translate → TTS → Blackhole 2ch → Genesys → Phone
+   */
   function enqueueTranscriptIncoming(event, msg) {
     if (!msg || msg.type !== 'transcript' || !msg.text || !msg.text.trim()) return;
     if (!isMeaningfulTranscript(msg.text)) return;
@@ -351,51 +333,310 @@ function bootRuntime({ app, createMainWindow }) {
     });
   }
 
-  const realtimeWs = createRealtimeWsSttService({
-    env,
-    logInfo,
-    logError,
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  2b. SPECULATIVE TRANSLATION CACHE + INTERIM FORWARDING
+   *
+   *  When Google STT interim results stabilize, we pre-translate them so
+   *  the final transcript can skip the translate step (~150-250ms saved).
+   * ═════════════════════════════════════════════════════════════════════ */
+
+  const speculativeCache = new Map();
+  const SPECULATIVE_CACHE_MAX = 20;
+
+  function speculativeCacheKey(text, srcLang, tgtLang) {
+    return `${String(text).trim().toLowerCase()}|${srcLang}|${tgtLang}`;
+  }
+
+  function speculateTranslation(text, detectedLanguage) {
+    if (!state.activeConfig) return;
+    const src = toVachanaLanguageCode(detectedLanguage || state.activeConfig.sourceLanguage);
+    const tgt = state.activeConfig.targetLanguage;
+    const key = speculativeCacheKey(text, src, tgt);
+    if (speculativeCache.has(key)) return;
+    const contextHint = getContextHint();
+    translator.translateText(text, src, tgt, contextHint)
+      .then((translated) => {
+        if (translated && translated.trim()) {
+          if (speculativeCache.size >= SPECULATIVE_CACHE_MAX) {
+            const firstKey = speculativeCache.keys().next().value;
+            speculativeCache.delete(firstKey);
+          }
+          speculativeCache.set(key, { translated, ts: Date.now() });
+        }
+      })
+      .catch((_err) => { /* speculative miss — pipeline will translate normally */ });
+  }
+
+  function speculateTranslationIncoming(text, detectedLanguage) {
+    if (!state.activeConfig) return;
+    const src = toVachanaLanguageCode(detectedLanguage || state.activeConfig.targetLanguage);
+    const tgt = toVachanaLanguageCode(state.activeConfig.sourceLanguage);
+    const key = speculativeCacheKey(text, src, tgt);
+    if (speculativeCache.has(key)) return;
+    const contextHint = getContextHintReverse();
+    translator.translateText(text, src, tgt, contextHint)
+      .then((translated) => {
+        if (translated && translated.trim()) {
+          if (speculativeCache.size >= SPECULATIVE_CACHE_MAX) {
+            const firstKey = speculativeCache.keys().next().value;
+            speculativeCache.delete(firstKey);
+          }
+          speculativeCache.set(key, { translated, ts: Date.now() });
+        }
+      })
+      .catch((_err) => {});
+  }
+
+  function getSpeculativeTranslation(text, srcLang, tgtLang) {
+    const key = speculativeCacheKey(text, srcLang, tgtLang);
+    const entry = speculativeCache.get(key);
+    if (!entry) return null;
+    speculativeCache.delete(key);
+    return entry.translated;
+  }
+
+  function sendInterimTranscript(event, payload) {
+    try { event.sender.send('transcript-interim', { ...payload, incoming: false }); } catch (_e) {}
+  }
+
+  function sendInterimTranscriptIncoming(event, payload) {
+    try { event.sender.send('transcript-interim', { ...payload, incoming: true }); } catch (_e) {}
+  }
+
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  3. GENESYS BRIDGE  (Phone ↔ Genesys ↔ Audio Devices)
+   *
+   *  Handles:
+   *    - Receiving transcripts from Genesys (bridge → enqueue)
+   *    - Publishing translated TTS audio back to Genesys (inject/both mode)
+   * ═════════════════════════════════════════════════════════════════════ */
+
+  function broadcastGenesysBridgeStatus(payload) {
+    if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+      state.mainWindow.webContents.send('genesys-bridge-status', payload);
+    }
+    if (state.activeSender && state.mainWindow && state.activeSender !== state.mainWindow.webContents) {
+      try { state.activeSender.send('genesys-bridge-status', payload); } catch (_err) { /* no-op */ }
+    }
+  }
+
+  const genesysBridgeService = createGenesysBridgeService({
+    env, logInfo, logError, normalizeTranscriptMessage,
+    onStatus: (payload) => {
+      artifacts.writeEvent('genesys_bridge_status', payload);
+      broadcastGenesysBridgeStatus(payload);
+    },
+    onTranscript: (transcriptPayload) => {
+      const bridgeEvent = { sender: state.mainWindow?.webContents || state.activeSender };
+      if (!bridgeEvent.sender) return;
+      if (String(transcriptPayload.direction || '').toLowerCase() === 'in') {
+        enqueueTranscriptIncoming(bridgeEvent, transcriptPayload);
+        return;
+      }
+      enqueueTranscript(bridgeEvent, transcriptPayload);
+    },
+  });
+
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  4. TTS QUEUE  (Translate output → TTS → Audio output)
+   *
+   *  Customer Pipeline: TTS in targetLanguage  → 'meeting' channel → Agent
+   *  Agent Pipeline:    TTS in sourceLanguage  → 'local' channel   → Genesys → Phone
+   * ═════════════════════════════════════════════════════════════════════ */
+
+  const ttsQueue = createTtsQueueService({
+    env, logInfo, logError, elapsedMs,
+    synthesizeRestTtsSequentialToRenderer: ttsService.synthesizeRestTtsSequentialToRenderer,
+    streamTTSRealtime: ttsService.streamTTSRealtime,
+    writeEvent: artifacts.writeEvent,
+    writePipelineRow: artifacts.writePipelineRow,
     sendStatus,
-    enqueueTranscript,
-    enqueueTranscriptIncoming,
-    sttRealtimeLangCode,
     getState,
-    setSockets,
+    onTtsChunk: (chunkPayload) => {
+      const chunkBytes = Buffer.from(String(chunkPayload.audioBase64 || ''), 'base64');
+      const sr = Number(chunkPayload.sampleRate || 16000);
+      const channel = String(chunkPayload.channel || 'meeting');
+      // Customer Pipeline → outgoingTranslated; Agent Pipeline → incomingTranslated
+      artifacts.appendAudioTrack(
+        channel === 'local' ? 'incomingTranslated' : 'outgoingTranslated',
+        chunkBytes, sr,
+      );
+      artifacts.appendAudioTrack('fullTranslatedConversation', chunkBytes, sr);
+      // Agent Pipeline: inject translated audio back to Genesys → Phone
+      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
+        genesysBridgeService.publishTtsChunk(chunkPayload);
+      }
+    },
+    onTtsAudio: (audioPayload) => {
+      const wavBytes = Buffer.from(String(audioPayload.audioBase64 || ''), 'base64');
+      const pcmBytes = extractPcmFromWavBuffer(wavBytes);
+      const channel = String(audioPayload.channel || 'meeting');
+      if (pcmBytes.length) {
+        artifacts.appendAudioTrack(
+          channel === 'local' ? 'incomingTranslated' : 'outgoingTranslated',
+          pcmBytes, Number(env('GOOGLE_TTS_SAMPLE_RATE', '16000')),
+        );
+        artifacts.appendAudioTrack('fullTranslatedConversation', pcmBytes, Number(env('GOOGLE_TTS_SAMPLE_RATE', '16000')));
+      }
+      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
+        genesysBridgeService.publishTtsAudio(audioPayload);
+      }
+    },
+    onTtsDone: (donePayload) => {
+      if (state.platform === 'genesys' && (state.deliveryMode === 'inject' || state.deliveryMode === 'both')) {
+        genesysBridgeService.publishTtsDone(donePayload);
+      }
+    },
+  });
+
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  5. TRANSCRIPT QUEUE  (STT output → Translate → TTS queue)
+   *
+   *  Shared by both pipelines. Direction is determined per-segment:
+   *    direction=undefined → Customer Pipeline (source→target, meeting channel)
+   *    direction='in'      → Agent Pipeline    (target→source, local channel)
+   * ═════════════════════════════════════════════════════════════════════ */
+
+  const transcriptQueue = createTranscriptQueueService({
+    env, logInfo, logError, elapsedMs,
+    appendContextText,
+    getContextHint,
+    getContextHintReverse,
+    toVachanaLanguageCode,
+    translateText: translator.translateText,
+    enqueueTtsJob: ttsQueue.enqueueTtsJob,
+    writeEvent: artifacts.writeEvent,
+    appendTranslatedLine,
+    appendConversationPair: artifacts.appendConversationPair,
+    getSpeculativeTranslation,
+  });
+
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  6. STT PROVIDERS  (Audio → Speech-to-Text)
+   *
+   *  Customer Pipeline STT: Blackhole 16ch audio → text
+   *  Agent Pipeline STT:    Agent microphone audio → text
+   *
+   *  Provider selected by STT_PROVIDER + VACHANA_STT_MODE env variables.
+   * ═════════════════════════════════════════════════════════════════════ */
+
+  const realtimeWs = createRealtimeWsSttService({
+    env, logInfo, logError, sendStatus,
+    enqueueTranscript, enqueueTranscriptIncoming,
+    sttRealtimeLangCode, getState,
+    setSockets: setState,
+  });
+
+  const googleStreamingStt = createGoogleStreamingSttService({
+    env, logInfo, logError, sendStatus,
+    enqueueTranscript, enqueueTranscriptIncoming,
+    sendInterimTranscript,
+    sendInterimTranscriptIncoming,
+    speculateTranslation,
+    speculateTranslationIncoming,
+    getGoogleSpeechClient: googleClients.getGoogleSpeechClient,
+    toBcp47: ttsService.toBcp47,
+    getState,
+    setStreams: setState,
+  });
+
+  const deepgramStreamingStt = createDeepgramStreamingSttService({
+    env, logInfo, logError, sendStatus,
+    enqueueTranscript, enqueueTranscriptIncoming,
+    sendInterimTranscript,
+    sendInterimTranscriptIncoming,
+    getState,
+    setSockets: setState,
   });
 
   const restLoops = createRestLoopSttService({
-    env,
-    logInfo,
-    logError,
-    elapsedMs,
-    sendStatus,
+    env, logInfo, logError, elapsedMs, sendStatus,
     transcribeViaGoogle: transcribeService.transcribeViaGoogle,
     transcribeViaRest: transcribeService.transcribeViaRest,
   });
 
+  // STT Provider Factory: unifies provider selection for both pipelines
+  const sttFactory = createSttProviderFactory({
+    env, logInfo, logError, sendStatus,
+    realtimeWs, googleStreamingStt, deepgramStreamingStt, restLoops,
+    getState, setState,
+  });
+
+  // Translation Provider Factory
+  const translationFactory = createTranslationProviderFactory({ env, translator });
+
+  // TTS Provider Factory
+  const ttsFactory = createTtsProviderFactory({ env, ttsService });
+
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  7. PIPELINE TEARDOWN
+   * ═════════════════════════════════════════════════════════════════════ */
+
   function teardownPipeline() {
     state.translationRunning = false;
+
+    // Timers
     if (state.metricsTimer) clearInterval(state.metricsTimer);
     if (state.restFlushTimer) clearInterval(state.restFlushTimer);
     if (state.restFlushTimerReturn) clearInterval(state.restFlushTimerReturn);
     state.metricsTimer = null;
     state.restFlushTimer = null;
     state.restFlushTimerReturn = null;
+
+    // Google STT stream recycle timers
+    googleStreamingStt.stopRecycleTimers();
+
+    // Customer Pipeline STT connections
     if (state.sttSocket) {
       try { state.sttSocket.close(); } catch (_e) {}
       state.sttSocket = null;
     }
+    if (state.sttGoogleStream) {
+      try { state.sttGoogleStream.destroy(); } catch (_e) {}
+      state.sttGoogleStream = null;
+    }
+
+    // Agent Pipeline STT connections
     if (state.sttSocketReturn) {
       try { state.sttSocketReturn.close(); } catch (_e) {}
       state.sttSocketReturn = null;
     }
+    if (state.sttGoogleStreamReturn) {
+      try { state.sttGoogleStreamReturn.destroy(); } catch (_e) {}
+      state.sttGoogleStreamReturn = null;
+    }
+
+    // Genesys bridge
     genesysBridgeService.stop('Pipeline teardown');
     artifacts.writePipelineSummary();
   }
 
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  8. IPC HANDLERS  (Renderer ↔ Main Process)
+   * ═════════════════════════════════════════════════════════════════════ */
+
   function registerIpc() {
+
+    /* ─── START TRANSLATION ──────────────────────────────────────────────
+     *
+     *  Initializes both pipelines in order:
+     *
+     *  Step 1: Read configuration
+     *  Step 2: Initialize artifacts & reset state
+     *  Step 3: Start Genesys bridge (if inject/both mode)
+     *  Step 4: Start Customer Pipeline STT
+     *           Blackhole 16ch → STT (provider per env) → enqueueTranscript
+     *  Step 5: Start Agent Pipeline STT (if bidirectional)
+     *           Agent Mic → STT (provider per env) → enqueueTranscriptIncoming
+     *
+     *  Once STT connects, the transcript queue handles:
+     *    STT text → Translate (provider per env) → TTS (provider per env) → Audio
+     * ─────────────────────────────────────────────────────────────────── */
+
     ipcMain.on('start-translation', (event, config = {}) => {
       state.activeSender = event.sender;
+
+      // Step 1: Read configuration
       const sourceLanguage = config.sourceLanguage || env('VACHANA_DEFAULT_SOURCE_LANGUAGE', 'en-IN');
       const targetLanguage = config.targetLanguage || env('VACHANA_DEFAULT_TARGET_LANGUAGE', 'hi-IN');
       const bidirectionalRequested = Boolean(config.bidirectional);
@@ -403,6 +644,8 @@ function bootRuntime({ app, createMainWindow }) {
       const deliveryMode = String(config.deliveryMode || 'assist').toLowerCase();
       const listenDeviceId = String(config.listenDeviceId || '').trim();
       const localOutputDeviceId = String(config.localOutputDeviceId || '').trim();
+
+      // Step 2: Initialize artifacts & reset state
       artifacts.initSessionArtifacts(appDir, sourceLanguage, targetLanguage);
       artifacts.writeEvent('session_start', {
         source_language: sourceLanguage,
@@ -413,19 +656,39 @@ function bootRuntime({ app, createMainWindow }) {
         listen_device_id: listenDeviceId,
         local_output_device_id: localOutputDeviceId,
       });
+
+      // Resolve per-language providers now that we know the languages
+      const sttProviderCustomer = sttFactory.resolveProviderForLang(sourceLanguage);
+      const sttProviderAgent = sttFactory.resolveProviderForLang(targetLanguage);
+      const sttMode = sttFactory.resolveMode();
+      const translationProvider = translationFactory.resolve();
+      const { provider: ttsProvider, realtimeWs: ttsRealtimeWs } = ttsFactory.resolve();
+
+      logInfo(
+        `[Config] CustomerPipeline STT=${sttProviderCustomer}/${sttMode} (${sourceLanguage} — ${isIndicLanguage(sourceLanguage) ? 'Indic→vachana' : 'foreign→deepgram'})`
+      );
+      logInfo(
+        `[Config] AgentPipeline    STT=${sttProviderAgent}/${sttMode} (${targetLanguage} — ${isIndicLanguage(targetLanguage) ? 'Indic→vachana' : 'foreign→deepgram'})`
+      );
+      logInfo(`[Config] Translation=${translationProvider} TTS=${ttsProvider}${ttsRealtimeWs ? '/ws' : ''}`);
+      logInfo(`[Config] source=${sourceLanguage} target=${targetLanguage} bidir=${bidirectionalRequested} platform=${platform} delivery=${deliveryMode}`);
+
       state.activeConfig = {
-        sourceLanguage,
-        targetLanguage,
+        sourceLanguage, targetLanguage,
         bidirectional: bidirectionalRequested,
-        platform,
-        deliveryMode,
-        listenDeviceId,
-        localOutputDeviceId,
+        platform, deliveryMode,
+        listenDeviceId, localOutputDeviceId,
       };
       state.platform = platform;
       state.deliveryMode = deliveryMode;
       state.translationRunning = true;
-      state.sttMode = 'ws';
+      state.sttMode = sttMode;
+      // Keep legacy sttProvider aligned with Customer Pipeline for REST-loop compat
+      state.sttProvider = sttProviderCustomer;
+      state.sttProviderCustomer = sttProviderCustomer;
+      state.sttProviderAgent = sttProviderAgent;
+      state.audioFramesForwarded = 0;
+      state.audioFramesDropped = 0;
       state.segmentCounter = 0;
       state.lastEnqueuedTranscriptNorm = '';
       state.lastEnqueuedTranscriptNormIncoming = '';
@@ -434,6 +697,7 @@ function bootRuntime({ app, createMainWindow }) {
       state.recentIncomingSourceContext = [];
       state.recentIncomingTargetContext = [];
 
+      // Step 3: Genesys bridge (Phone ↔ Genesys)
       if (platform === 'genesys' && (deliveryMode === 'inject' || deliveryMode === 'both')) {
         genesysBridgeService.start({
           deliveryMode,
@@ -450,45 +714,73 @@ function bootRuntime({ app, createMainWindow }) {
         genesysBridgeService.stop('Bridge disabled for current mode');
       }
 
+      // Metrics timer
       if (state.metricsTimer) clearInterval(state.metricsTimer);
       state.metricsTimer = setInterval(() => {
         if (state.translationRunning) {
-          logInfo(`AUDIO queue=${transcriptQueue.getQueue().length}`);
+          logInfo(
+            `AUDIO frames forwarded=${state.audioFramesForwarded}, `
+            + `dropped=${state.audioFramesDropped}, `
+            + `transcriptQueue=${transcriptQueue.getQueue().length}`
+          );
         }
       }, 5000);
 
-      const sttModePref = env('VACHANA_STT_MODE', 'ws').toLowerCase();
-      if (sttModePref === 'rest') {
+      // Step 4 & 5: Connect both pipelines via STT factory
+
+      if (sttMode === 'rest') {
+        // REST mode: start polling loops (no async connect needed)
         state.sttMode = 'rest';
-        restLoops.startRestSttFallback({ state, setState, event, sourceLanguage, enqueueTranscript });
+
+        // Customer Pipeline: Blackhole 16ch → REST STT → enqueueTranscript
+        sttFactory.connectCustomerStt(event, sourceLanguage, { enqueueTranscript, state });
+
         if (bidirectionalRequested) {
-          restLoops.startRestSttReturnPath({ state, event, targetLanguage, enqueueTranscriptIncoming });
-          return sendStatus(event, true, `Bidirectional REST mode [${platform}/${deliveryMode}]: you (${sourceLanguage}) → meeting; team (${targetLanguage}) → headphones.`);
+          // Agent Pipeline: Agent Mic → REST STT → enqueueTranscriptIncoming
+          sttFactory.connectAgentStt(event, targetLanguage, { enqueueTranscriptIncoming, state });
+          return sendStatus(event, true,
+            `Bidirectional REST mode [${platform}/${deliveryMode}]: customer (${sourceLanguage}) → agent; agent (${targetLanguage}) → phone.`
+          );
         }
-        return sendStatus(event, true, `Pipeline started in REST mode (${sourceLanguage} -> ${targetLanguage}) [${platform}/${deliveryMode}].`);
+        return sendStatus(event, true,
+          `Pipeline started in REST mode (${sourceLanguage} → ${targetLanguage}) [${platform}/${deliveryMode}].`
+        );
       }
 
-      realtimeWs.connectSTT(event, sourceLanguage)
+      // Streaming mode: connect WebSocket / Google streaming
+      // Step 4: Customer Pipeline STT
+      sttFactory.connectCustomerStt(event, sourceLanguage, { enqueueTranscript, state })
         .then(() => {
           state.sttMode = 'ws';
-          if (!state.activeConfig.bidirectional) {
-            sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}) [${platform}/${deliveryMode}].`);
+
+          if (!bidirectionalRequested) {
+            sendStatus(event, true,
+              `Customer Pipeline started (${sourceLanguage} → ${targetLanguage}) [${platform}/${deliveryMode}].`
+            );
             return;
           }
-          return realtimeWs.connectSTTReturn(event, targetLanguage)
-            .then(() => sendStatus(event, true, `Bidirectional [${platform}/${deliveryMode}]: you → ${targetLanguage} (meeting); team → ${sourceLanguage} (headphones).`))
+
+          // Step 5: Agent Pipeline STT
+          return sttFactory.connectAgentStt(event, targetLanguage, { enqueueTranscriptIncoming, state })
+            .then(() => sendStatus(event, true,
+              `Bidirectional [${platform}/${deliveryMode}]: customer (${sourceLanguage}) → agent; agent (${targetLanguage}) → phone.`
+            ))
             .catch((err) => {
               state.activeConfig.bidirectional = false;
-              logError(`Return STT connect failed: ${err.message}`);
-              sendStatus(event, true, `Pipeline started (${sourceLanguage} -> ${targetLanguage}) [${platform}/${deliveryMode}]. Team listen disabled: ${err.message}`);
+              logError(`[AgentPipeline] STT connect failed: ${err.message}`);
+              sendStatus(event, true,
+                `Customer Pipeline started (${sourceLanguage} → ${targetLanguage}) [${platform}/${deliveryMode}]. Agent pipeline disabled: ${err.message}`
+              );
             });
         })
         .catch((error) => {
-          const restFallback = env('ENABLE_STT_REST_FALLBACK', 'true').toLowerCase() === 'true';
-          if (restFallback) {
+          // Customer Pipeline STT failed; try REST fallback
+          const didFallback = sttFactory.fallbackCustomerToRest(event, sourceLanguage, {
+            enqueueTranscript, state,
+          });
+          if (didFallback) {
             state.sttMode = 'rest';
-            restLoops.startRestSttFallback({ state, setState, event, sourceLanguage, enqueueTranscript });
-            sendStatus(event, true, `WS STT failed (${error.message}). REST fallback active.`);
+            sendStatus(event, true, `STT streaming failed (${error.message}). REST fallback active.`);
             return;
           }
           state.translationRunning = false;
@@ -497,11 +789,15 @@ function bootRuntime({ app, createMainWindow }) {
         });
     });
 
+    /* ─── STOP TRANSLATION ───────────────────────────────────────────── */
+
     ipcMain.on('stop-translation', (event) => {
       artifacts.writeEvent('session_stop', {});
       teardownPipeline();
       sendStatus(event, false, 'Translation stopped.');
     });
+
+    /* ─── GENESYS BRIDGE IPC ─────────────────────────────────────────── */
 
     ipcMain.handle('genesys-bridge-start', async (_event, bridgeConfig = {}) => {
       const mergedConfig = {
@@ -524,33 +820,64 @@ function bootRuntime({ app, createMainWindow }) {
       return genesysBridgeService.status();
     });
 
+    /* ─── CUSTOMER PIPELINE: AUDIO INPUT ─────────────────────────────
+     *
+     *  Blackhole 16ch → audio-chunk IPC → STT provider
+     *
+     *  This is the entry point for the Customer Pipeline.
+     *  Audio from the phone call (via Genesys → Blackhole 16ch) arrives
+     *  as 1024-byte PCM16 frames from the renderer's audio capture.
+     * ─────────────────────────────────────────────────────────────── */
+
     ipcMain.on('audio-chunk', (_event, chunkBytes) => {
-      if (!state.translationRunning || !chunkBytes) return;
-      const buffer = Buffer.isBuffer(chunkBytes) ? chunkBytes : Buffer.from(chunkBytes);
-      if (buffer.length !== 1024) return;
-      artifacts.appendAudioTrack('outgoingReal', buffer, 16000);
-      artifacts.appendAudioTrack('fullRealConversation', buffer, 16000);
-      if (state.sttMode === 'rest') {
-        state.restAudioBuffer.push(buffer);
+      if (!state.translationRunning) return;
+      if (!chunkBytes) {
+        state.audioFramesDropped += 1;
         return;
       }
-      if (!state.sttSocket || state.sttSocket.readyState !== 1) return;
-      state.sttSocket.send(buffer);
+      const buffer = Buffer.isBuffer(chunkBytes) ? chunkBytes : Buffer.from(chunkBytes);
+      if (buffer.length !== 1024) {
+        state.audioFramesDropped += 1;
+        return;
+      }
+
+      // Record raw customer audio
+      artifacts.appendAudioTrack('outgoingReal', buffer, 16000);
+      artifacts.appendAudioTrack('fullRealConversation', buffer, 16000);
+
+      // Route to Customer Pipeline STT (via factory)
+      const forwarded = sttFactory.routeCustomerAudio(buffer);
+      if (forwarded) {
+        state.audioFramesForwarded += 1;
+      } else {
+        state.audioFramesDropped += 1;
+      }
     });
+
+    /* ─── AGENT PIPELINE: AUDIO INPUT ────────────────────────────────
+     *
+     *  Agent Mic → audio-chunk-return IPC → STT provider
+     *
+     *  This is the entry point for the Agent Pipeline.
+     *  Audio from the agent's microphone arrives as 1024-byte PCM16
+     *  frames. After STT → Translate → TTS, the output goes to
+     *  Blackhole 2ch → Genesys → Phone.
+     * ─────────────────────────────────────────────────────────────── */
 
     ipcMain.on('audio-chunk-return', (_event, chunkBytes) => {
       if (!state.translationRunning || !state.activeConfig?.bidirectional || !chunkBytes) return;
       const buffer = Buffer.isBuffer(chunkBytes) ? chunkBytes : Buffer.from(chunkBytes);
       if (buffer.length !== 1024) return;
+
+      // Record raw agent audio
       artifacts.appendAudioTrack('incomingReal', buffer, 16000);
       artifacts.appendAudioTrack('fullRealConversation', buffer, 16000);
-      if (state.sttMode === 'rest') {
-        state.restAudioBufferReturn.push(buffer);
-        return;
-      }
-      if (!state.sttSocketReturn || state.sttSocketReturn.readyState !== 1) return;
-      state.sttSocketReturn.send(buffer);
+
+      // Route to Agent Pipeline STT (via factory)
+      sttFactory.routeAgentAudio(buffer);
     });
+
+    /* ─── MIC ACTIVITY ───────────────────────────────────────────────── */
 
     ipcMain.on('mic-activity', (_event, payload = {}) => {
       const rms = Number(payload.rms || 0).toFixed(4);
@@ -560,6 +887,8 @@ function bootRuntime({ app, createMainWindow }) {
       const targetLang = payload.targetLang || state.activeConfig?.targetLanguage || 'n/a';
       logInfo(`MIC activity speaking=${speaking} rms=${rms} queuedFrames=${queuedFrames} lang=${sourceLang}->${targetLang}`);
     });
+
+    /* ─── VOICE ENROLLMENT ───────────────────────────────────────────── */
 
     ipcMain.handle('enroll-voice', async (_event, wavBase64) => {
       const startMs = Date.now();
@@ -612,6 +941,10 @@ function bootRuntime({ app, createMainWindow }) {
     });
   }
 
+  /* ═════════════════════════════════════════════════════════════════════════
+   *  9. APP LIFECYCLE
+   * ═════════════════════════════════════════════════════════════════════ */
+
   app.whenReady().then(() => {
     state.mainWindow = createMainWindow();
     state.mainWindow.webContents.on('did-finish-load', () => {
@@ -627,6 +960,8 @@ function bootRuntime({ app, createMainWindow }) {
       }
     });
     registerIpc();
+    const sttPref = String(env('STT_PROVIDER', 'auto')).toLowerCase();
+    logInfo(`Providers: STT=${sttPref}/${sttFactory.resolveMode()} (auto-selects vachana=Indic / deepgram=foreign) Translation=${translationFactory.resolve()} TTS=${ttsFactory.resolve().provider}`);
     sendStatus({ sender: state.mainWindow.webContents }, false, 'Ready.');
   });
 

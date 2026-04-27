@@ -12,6 +12,7 @@ function createTranscriptQueueService({
   writeEvent,
   appendTranslatedLine,
   appendConversationPair,
+  getSpeculativeTranslation,
 }) {
   let queueProcessing = false;
   const transcriptQueue = [];
@@ -49,13 +50,21 @@ function createTranscriptQueueService({
 
           let translatedText = '';
           const translateStartMs = Date.now();
-          try {
-            translatedText = await translateText(item.text, sourceLanguage, targetLanguage, contextHint);
-          } catch (error) {
-            const fallbackToSource = env('FALLBACK_TO_SOURCE_TEXT_ON_TRANSLATE_ERROR', 'true').toLowerCase() === 'true';
-            if (!fallbackToSource) throw error;
-            logError(`TRANSLATE ERROR -> using source text fallback: ${error.message}`);
-            translatedText = item.text;
+          const specHit = typeof getSpeculativeTranslation === 'function'
+            ? getSpeculativeTranslation(item.text, sourceLanguage, targetLanguage)
+            : null;
+          if (specHit) {
+            translatedText = specHit;
+            logInfo(`SPECULATIVE HIT translate skipped for seg=${item.id} (saved ~${elapsedMs(translateStartMs)}ms)`);
+          } else {
+            try {
+              translatedText = await translateText(item.text, sourceLanguage, targetLanguage, contextHint);
+            } catch (error) {
+              const fallbackToSource = env('FALLBACK_TO_SOURCE_TEXT_ON_TRANSLATE_ERROR', 'true').toLowerCase() === 'true';
+              if (!fallbackToSource) throw error;
+              logError(`TRANSLATE ERROR -> using source text fallback: ${error.message}`);
+              translatedText = item.text;
+            }
           }
 
           const translateElapsedMs = elapsedMs(translateStartMs);

@@ -75,7 +75,7 @@ function createArtifactService({ env, nowISO, logInfo, logError }) {
       + `Session started : ${nowISO()}\n`
       + `Source language  : ${sourceLanguage}\n`
       + `Target language  : ${targetLanguage}\n`
-      + `STT provider     : ${env('STT_PROVIDER', 'vachana')}\n`
+      + `STT provider     : ${env('STT_PROVIDER', 'google')}\n`
       + `Translate provider: ${env('TRANSLATION_PROVIDER', 'google')}\n`
       + `TTS provider     : ${env('TTS_PROVIDER', 'google')}\n\n`
       + '─'.repeat(80) + '\n';

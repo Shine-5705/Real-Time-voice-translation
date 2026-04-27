@@ -9,6 +9,7 @@ function createMainWindow() {
       preload: path.join(__dirname, '..', '..', 'renderer', 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
 

@@ -7,7 +7,14 @@ function createRestLoopSttService({
   transcribeViaGoogle,
   transcribeViaRest,
 }) {
-  function startRestSttFallback({ state, setState, event, sourceLanguage, enqueueTranscript }) {
+  function startRestSttFallback({
+    state,
+    setState,
+    event,
+    sourceLanguage,
+    enqueueTranscript,
+    providerOverride = '',
+  }) {
     setState({
       sttMode: 'rest',
       restAudioBuffer: [],
@@ -17,7 +24,7 @@ function createRestLoopSttService({
 
     if (state.restFlushTimer) clearInterval(state.restFlushTimer);
 
-    const sttProvider = env('STT_PROVIDER', 'vachana').toLowerCase();
+    const sttProvider = String(providerOverride || env('STT_PROVIDER', 'vachana')).toLowerCase();
     const defaultMinBytes = sttProvider === 'google' ? '48000' : '32000';
     const defaultFlushMs = sttProvider === 'google' ? '2500' : '1500';
     const minBytesPerFlush = Number(env('VACHANA_STT_REST_MIN_BYTES', defaultMinBytes));
@@ -40,7 +47,7 @@ function createRestLoopSttService({
       state.restInFlight = true;
 
       try {
-        const provider = env('STT_PROVIDER', 'vachana').toLowerCase();
+        const provider = sttProvider;
         sendStatus(event, true, `${provider === 'google' ? 'Google' : 'REST'} STT processing...`);
         const transcribeFn = provider === 'google' ? transcribeViaGoogle : transcribeViaRest;
         const sttStartMs = Date.now();
@@ -65,17 +72,23 @@ function createRestLoopSttService({
     }, flushEveryMs);
 
     state.restFlushTimer = timer;
-    logInfo('STT mode switched to REST fallback');
-    sendStatus(event, true, 'Realtime STT unavailable. Using REST STT fallback.');
+    logInfo(`STT mode switched to REST fallback (provider=${sttProvider})`);
+    sendStatus(event, true, `Realtime STT unavailable. Using REST STT fallback (${sttProvider}).`);
   }
 
-  function startRestSttReturnPath({ state, event, targetLanguage, enqueueTranscriptIncoming }) {
+  function startRestSttReturnPath({
+    state,
+    event,
+    targetLanguage,
+    enqueueTranscriptIncoming,
+    providerOverride = '',
+  }) {
     state.restAudioBufferReturn = [];
     state.restInFlightReturn = false;
     state.restOverlapBufferReturn = Buffer.alloc(0);
     if (state.restFlushTimerReturn) clearInterval(state.restFlushTimerReturn);
 
-    const sttProvider = env('STT_PROVIDER', 'vachana').toLowerCase();
+    const sttProvider = String(providerOverride || env('STT_PROVIDER', 'vachana')).toLowerCase();
     const minBytesPerFlush = Number(env('STT_RETURN_MIN_BYTES', '32000'));
     const flushEveryMs = Number(env('STT_RETURN_FLUSH_MS', '2000'));
     const overlapMs = Number(env('VACHANA_STT_REST_OVERLAP_MS', '400'));

@@ -1,3 +1,80 @@
+/**
+ * Indic-script language codes (ISO 639-1 roots).
+ * Vachana STT is trained on these Indic languages.
+ *
+ * NOTE: English (en/en-IN) is NOT here — routed to Deepgram in auto mode.
+ */
+const INDIC_LANG_ROOTS = new Set([
+  'hi',  // Hindi
+  'bn',  // Bengali
+  'gu',  // Gujarati
+  'kn',  // Kannada
+  'ml',  // Malayalam
+  'mr',  // Marathi
+  'pa',  // Punjabi
+  'ta',  // Tamil
+  'te',  // Telugu
+  'as',  // Assamese
+  'or',  // Odia
+  'ur',  // Urdu
+  'ks',  // Kashmiri
+  'ne',  // Nepali
+  'sa',  // Sanskrit
+  'sd',  // Sindhi
+  'mai', // Maithili
+]);
+
+/**
+ * Returns true when the language is an Indic-script language (→ Vachana STT),
+ * false for English and other foreign languages (→ Deepgram STT in auto mode).
+ *
+ * Rules:
+ *   1. English is always false (en-IN, en-US, en-GB… all go to Deepgram in auto mode)
+ *   2. Hinglish/Tanglish (code-mixed) → true (Vachana handles these)
+ *   3. If the ISO 639 root is in INDIC_LANG_ROOTS → true
+ *   4. If the BCP-47 tag ends with -IN and root isn't 'en' → true
+ *   5. Otherwise → false (Deepgram in auto mode)
+ */
+function isIndicLanguage(langCode) {
+  const lc = String(langCode || '').toLowerCase().trim();
+  if (!lc) return false;
+  const root = lc.split('-')[0];
+
+  // English always goes to Google — Vachana WS doesn't return transcripts for en
+  if (root === 'en') return false;
+
+  // Code-mixed Indian English varieties → Vachana handles these
+  if (lc === 'en-hi-in-latn' || lc === 'tanglish' || lc === 'hinglish') return true;
+
+  // Indic language roots
+  if (INDIC_LANG_ROOTS.has(root)) return true;
+
+  // Any -IN tagged language that isn't English
+  if (lc.includes('-in')) return true;
+
+  return false;
+}
+
+/**
+ * Resolve which STT provider to use for a given language.
+ *
+ * Priority order:
+ *   1. STT_PROVIDER=google   → always google
+ *   2. STT_PROVIDER=deepgram → always deepgram
+ *   3. STT_PROVIDER=vachana  → always vachana
+ *   3. STT_PROVIDER=auto (default):
+ *      Indic languages (hi, bn, ta, te, …) → vachana
+ *      English + foreign (en-IN, en-US, fr, de, …) → deepgram
+ */
+function sttProviderForLanguage(langCode, envFn) {
+  const globalPref = String(envFn('STT_PROVIDER', 'auto')).toLowerCase();
+  if (globalPref === 'google') return 'google';
+  if (globalPref === 'deepgram') return 'deepgram';
+  if (globalPref === 'vachana') return 'vachana';
+  // auto mode
+  return isIndicLanguage(langCode) ? 'vachana' : 'deepgram';
+}
+
 function normalizeLangCode(langCode) {
   if (!langCode) return 'en';
   const lower = String(langCode).toLowerCase();
@@ -90,6 +167,8 @@ function parseTranslationText(payload) {
 }
 
 module.exports = {
+  isIndicLanguage,
+  sttProviderForLanguage,
   normalizeLangCode,
   toVachanaLanguageCode,
   sttRealtimeLangCode,
