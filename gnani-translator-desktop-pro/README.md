@@ -40,6 +40,21 @@ Set these keys in your repo `.env` when using Genesys mode:
 - `GENESYS_BRIDGE_API_KEY` - optional bearer key for your bridge endpoint
 - `GENESYS_BRIDGE_RECONNECT_MAX_MS` - max reconnect backoff in ms (default `30000`)
 
+## Colloquial translation (natural spoken output)
+
+To avoid overly formal translations (for example very "pure" Hindi), enable the colloquial rewrite layer:
+
+- `ENABLE_COLLOQUIAL_TRANSLATION=true`
+- `COLLOQUIAL_API_ENDPOINT=<openai-compatible chat completions endpoint>`
+- `COLLOQUIAL_API_KEY=<bearer token>`
+- `COLLOQUIAL_MODEL=openai/gpt-oss-120b`
+- Optional tuning:
+  - `COLLOQUIAL_REWRITE_TIMEOUT_MS=900`
+  - `COLLOQUIAL_REWRITE_TEMPERATURE=0.1`
+  - `COLLOQUIAL_REWRITE_MAX_TOKENS=140`
+
+This runs after base translation (Google or Vachana) and rewrites into more natural, everyday spoken language while preserving meaning.
+
 ## Phase 1 (implemented)
 
 The app now boots the **full existing working pipeline** from
