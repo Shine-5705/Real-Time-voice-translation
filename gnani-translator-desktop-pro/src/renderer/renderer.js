@@ -77,8 +77,14 @@ const FULL_DUPLEX_OVERLAP_CAPTURE = true;
 const OVERLAP_ATTENUATION_GAIN = 0.35;
 let adaptiveNoiseFloor = 0.002;
 let adaptiveHangoverLeft = 0;
+let returnAdaptiveNoiseFloor = 0.002;
+let returnAdaptiveHangoverLeft = 0;
 const MIC_HIGHPASS_HZ = 120;
 const MIC_LOWPASS_HZ = 3800;
+const RETURN_PREAMP_GAIN = 1.4;
+const STT_SENDER_INTERVAL_MS = 16;
+const STT_MAX_FRAMES_PER_TICK = 4;
+const CAPTURE_BUFFER_SIZE = 512;
 let ttsChunkBytesQueue = [];
 let ttsChunkMeta = { sampleRate: 16000, numChannels: 1, sampleWidth: 2, channel: 'meeting' };
 let ttsAggregateTimer = null;
@@ -345,26 +351,44 @@ function applyGain(floatArray, gain) {
   return out;
 }
 
-function applyAdaptiveSpeechGate(floatArray) {
+function applyAdaptiveSpeechGateWithState(floatArray, state) {
   if (!MIC_ADAPTIVE_GATE_ENABLED) {
     return floatArray;
   }
   const rms = computeRms(floatArray);
   const mult = 10 ** (MIC_ADAPTIVE_SPEECH_DB / 20);
-  const thr = Math.max(adaptiveNoiseFloor * mult, 1e-5);
+  const thr = Math.max(state.noiseFloor * mult, 1e-5);
   const isSpeech = rms >= thr;
   if (!isSpeech && rms < thr * 0.4) {
-    adaptiveNoiseFloor = adaptiveNoiseFloor * (1 - MIC_ADAPTIVE_FLOOR_LEAK) + rms * MIC_ADAPTIVE_FLOOR_LEAK;
+    state.noiseFloor = state.noiseFloor * (1 - MIC_ADAPTIVE_FLOOR_LEAK) + rms * MIC_ADAPTIVE_FLOOR_LEAK;
   }
-  if (isSpeech || adaptiveHangoverLeft > 0) {
+  if (isSpeech || state.hangoverLeft > 0) {
     if (isSpeech) {
-      adaptiveHangoverLeft = MIC_ADAPTIVE_HANGOVER_FRAMES;
+      state.hangoverLeft = MIC_ADAPTIVE_HANGOVER_FRAMES;
     } else {
-      adaptiveHangoverLeft -= 1;
+      state.hangoverLeft -= 1;
     }
     return floatArray;
   }
   return new Float32Array(floatArray.length);
+}
+
+function applyAdaptiveSpeechGate(floatArray) {
+  return applyAdaptiveSpeechGateWithState(floatArray, {
+    get noiseFloor() { return adaptiveNoiseFloor; },
+    set noiseFloor(v) { adaptiveNoiseFloor = v; },
+    get hangoverLeft() { return adaptiveHangoverLeft; },
+    set hangoverLeft(v) { adaptiveHangoverLeft = v; },
+  });
+}
+
+function applyAdaptiveSpeechGateReturn(floatArray) {
+  return applyAdaptiveSpeechGateWithState(floatArray, {
+    get noiseFloor() { return returnAdaptiveNoiseFloor; },
+    set noiseFloor(v) { return returnAdaptiveNoiseFloor = v; },
+    get hangoverLeft() { return returnAdaptiveHangoverLeft; },
+    set hangoverLeft(v) { return returnAdaptiveHangoverLeft = v; },
+  });
 }
 
 function applySoftNoiseGate(floatArray) {
@@ -462,14 +486,15 @@ function emitMicTelemetry(floatArray) {
 
 function startPacedSttSender() {
   stopPacedSttSender();
-  // Flush all queued frames each tick to minimise IPC overhead while
-  // maintaining the 32ms real-time cadence.
+  // Keep sender cadence tighter than capture callback to reduce first-byte latency.
   sttSendTimer = setInterval(() => {
     if (sttFrameQueue.length === 0) return;
-    while (sttFrameQueue.length > 0) {
+    let sent = 0;
+    while (sttFrameQueue.length > 0 && sent < STT_MAX_FRAMES_PER_TICK) {
       window.electronAPI.sendAudioChunk(sttFrameQueue.shift());
+      sent += 1;
     }
-  }, 32);
+  }, STT_SENDER_INTERVAL_MS);
 }
 
 function stopPacedSttSender() {
@@ -484,13 +509,15 @@ function startPacedReturnSttSender() {
   stopPacedReturnSttSender();
   returnSttSendTimer = setInterval(() => {
     if (returnSttFrameQueue.length === 0) return;
-    while (returnSttFrameQueue.length > 0) {
+    let sent = 0;
+    while (returnSttFrameQueue.length > 0 && sent < STT_MAX_FRAMES_PER_TICK) {
       const frame = returnSttFrameQueue.shift();
       if (window.electronAPI.sendAudioChunkReturn) {
         window.electronAPI.sendAudioChunkReturn(frame);
       }
+      sent += 1;
     }
-  }, 32);
+  }, STT_SENDER_INTERVAL_MS);
 }
 
 function stopPacedReturnSttSender() {
@@ -850,6 +877,10 @@ function teardownAudioGraph() {
   }
 
   pcmBuffer = new Int16Array(0);
+  adaptiveNoiseFloor = 0.002;
+  adaptiveHangoverLeft = 0;
+  returnAdaptiveNoiseFloor = 0.002;
+  returnAdaptiveHangoverLeft = 0;
   playbackQueue.splice(0, playbackQueue.length);
   playbackActive = false;
 }
@@ -925,9 +956,9 @@ async function startListenPipeline(listenDeviceId) {
     : {};
   const audioConstraints = {
     deviceId: { exact: listenDeviceId },
-    echoCancellation: false,
-    noiseSuppression: false,
-    autoGainControl: true,
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: false,
     channelCount: 1,
     sampleRate: 16000,
   };
@@ -946,7 +977,7 @@ async function startListenPipeline(listenDeviceId) {
   returnLowpassNode.type = 'lowpass';
   returnLowpassNode.frequency.value = MIC_LOWPASS_HZ;
 
-  returnProcessorNode = returnAudioContext.createScriptProcessor(1024, 1, 1);
+  returnProcessorNode = returnAudioContext.createScriptProcessor(CAPTURE_BUFFER_SIZE, 1, 1);
   returnSilentGainNode = returnAudioContext.createGain();
   returnSilentGainNode.gain.value = 0;
 
@@ -975,7 +1006,9 @@ async function startListenPipeline(listenDeviceId) {
     const inputRate = e.inputBuffer.sampleRate || returnAudioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
-    let boosted = applyGain(resampled, 2.0);
+    const adaptive = applyAdaptiveSpeechGateReturn(resampled);
+    const gated = applySoftNoiseGate(adaptive);
+    let boosted = applyGain(gated, RETURN_PREAMP_GAIN);
     if (FULL_DUPLEX_OVERLAP_CAPTURE && (ttsGated || micGated)) {
       // In overlap conversations, attenuate instead of dropping so both sides are still transcribed.
       boosted = applyGain(boosted, OVERLAP_ATTENUATION_GAIN);
@@ -1028,7 +1061,7 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
   lowpassNode.type = 'lowpass';
   lowpassNode.frequency.value = MIC_LOWPASS_HZ;
 
-  processorNode = audioContext.createScriptProcessor(1024, 1, 1);
+  processorNode = audioContext.createScriptProcessor(CAPTURE_BUFFER_SIZE, 1, 1);
   silentGainNode = audioContext.createGain();
   silentGainNode.gain.value = 0;
 

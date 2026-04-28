@@ -12,8 +12,15 @@ function createTranslator({
 }) {
   const translationCache = new Map();
 
+  function styleCacheTag() {
+    const colloquialOn = String(env('ENABLE_COLLOQUIAL_TRANSLATION', 'false')).toLowerCase() === 'true';
+    if (!colloquialOn) return 'formal';
+    const model = String(env('COLLOQUIAL_MODEL', 'openai/gpt-oss-120b')).trim();
+    return `colloquial:${model}`;
+  }
+
   function cacheKey(text, sourceLanguage, targetLanguage) {
-    return `${normalizeLangCode(sourceLanguage)}::${normalizeLangCode(targetLanguage)}::${String(text || '').trim().toLowerCase()}`;
+    return `${normalizeLangCode(sourceLanguage)}::${normalizeLangCode(targetLanguage)}::${styleCacheTag()}::${String(text || '').trim().toLowerCase()}`;
   }
 
   function getCachedTranslation(text, sourceLanguage, targetLanguage) {
@@ -116,6 +123,96 @@ function createTranslator({
     return String(result || '').trim();
   }
 
+  async function rewriteColloquialIfEnabled(translatedText, sourceLanguage, targetLanguage, originalText) {
+    const enabled = String(env('ENABLE_COLLOQUIAL_TRANSLATION', 'false')).toLowerCase() === 'true';
+    if (!enabled) return translatedText;
+    const base = String(translatedText || '').trim();
+    if (!base) return base;
+
+    const endpoint = String(env('COLLOQUIAL_API_ENDPOINT', '')).trim();
+    const apiKey = String(env('COLLOQUIAL_API_KEY', '')).trim();
+    if (!endpoint || !apiKey) {
+      logInfo('Colloquial rewrite enabled but endpoint/key missing; using base translation.');
+      return base;
+    }
+
+    const model = String(env('COLLOQUIAL_MODEL', 'openai/gpt-oss-120b')).trim();
+    const timeoutMs = Number(env('COLLOQUIAL_REWRITE_TIMEOUT_MS', '900'));
+    const temperature = Number(env('COLLOQUIAL_REWRITE_TEMPERATURE', '0.1'));
+    const maxTokens = Number(env('COLLOQUIAL_REWRITE_MAX_TOKENS', '140'));
+    const topP = Number(env('COLLOQUIAL_REWRITE_TOP_P', '1'));
+    const stop = String(env('COLLOQUIAL_REWRITE_STOP', 'None'));
+    const reasoning = String(env('COLLOQUIAL_REWRITE_REASONING', 'low'));
+
+    const systemPrompt =
+      "You are a real-time speech translation rewriter for TTS output. " +
+      "Convert text into natural, conversational spoken language used in everyday speech. " +
+
+      "Strict rules: " +
+      "- Preserve the original meaning exactly. Do not add, remove, or infer information. " +
+      "- Use simple, commonly spoken words. Avoid formal, literary, or textbook phrasing. " +
+      "- Keep widely used English or global loan-words when they are naturally spoken (e.g., TV, mobile, internet). " +
+      "- Prefer shorter, speech-friendly sentences. " +
+      "- Ensure the output sounds natural when spoken aloud. " +
+      "- Do not translate proper nouns, brand names, or technical terms unnecessarily. " +
+      "- Maintain the original language unless explicitly instructed otherwise. " +
+
+      "Output rules: " +
+      "- Return only the rewritten text. " +
+      "- No explanations, no extra text, no formatting.";
+
+    const userPrompt =
+      `Source language: ${sourceLanguage}\n`
+      + `Target language: ${targetLanguage}\n`
+      + `Original source text: ${String(originalText || '').trim()}\n`
+      + `Current translation: ${base}\n`
+      + 'Rewrite now in natural spoken target language.';
+
+    try {
+      const startMs = Date.now();
+      const response = await fetchWithTimeout(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature,
+          max_tokens: maxTokens,
+          top_p: topP,
+          stop,
+          stream: false,
+          tools: [],
+          reasoning,
+        }),
+      }, timeoutMs);
+
+      if (!response.ok) {
+        const body = await response.text();
+        logError(`Colloquial rewrite error status=${response.status} body=${body.slice(0, 240)}`);
+        return base;
+      }
+
+      const payload = await response.json();
+      const rewritten = String(
+        payload?.choices?.[0]?.message?.content
+        || payload?.choices?.[0]?.text
+        || ''
+      ).trim();
+      if (!rewritten) return base;
+      logInfo(`Colloquial rewrite elapsed_ms=${elapsedMs(startMs)} base_len=${base.length} out_len=${rewritten.length}`);
+      return rewritten;
+    } catch (err) {
+      logError(`Colloquial rewrite exception: ${err.message}`);
+      return base;
+    }
+  }
+
   async function translateText(text, sourceLanguage, targetLanguage, contextHint = { source: '', target: '' }) {
     if (!text || !text.trim()) {
       return '';
@@ -131,14 +228,16 @@ function createTranslator({
     if (provider === 'google') {
       try {
         const translated = await hedgedGoogleTranslate(text, sourceLanguage, targetLanguage);
-        if (translated) setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
-        return translated;
+        const colloquial = await rewriteColloquialIfEnabled(translated, sourceLanguage, targetLanguage, text);
+        if (colloquial) setCachedTranslation(text, sourceLanguage, targetLanguage, colloquial);
+        return colloquial;
       } catch (err) {
         logError(`Google Translate error: ${err.message}`);
         logInfo('Google Translate failed. Trying public fallback.');
         const translated = await translateViaPublicFallback(text, sourceLanguage, targetLanguage);
-        if (translated) setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
-        return translated;
+        const colloquial = await rewriteColloquialIfEnabled(translated, sourceLanguage, targetLanguage, text);
+        if (colloquial) setCachedTranslation(text, sourceLanguage, targetLanguage, colloquial);
+        return colloquial;
       }
     }
 
@@ -191,8 +290,9 @@ function createTranslator({
         const translated = parseTranslationText(payload);
         if (translated) {
           logInfo(`Translate parsed endpoint=${url} translated_len=${translated.length} elapsed_ms=${elapsedMs(translateReqStartMs)}`);
-          setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
-          return translated;
+          const colloquial = await rewriteColloquialIfEnabled(translated, sourceLanguage, targetLanguage, text);
+          setCachedTranslation(text, sourceLanguage, targetLanguage, colloquial);
+          return colloquial;
         }
 
         lastError = `No translated text field at ${url}`;
@@ -210,8 +310,9 @@ function createTranslator({
 
     logInfo(`Primary translate failed (${lastError}). Trying fallback translator.`);
     const translated = await translateViaPublicFallback(text, sourceLanguage, targetLanguage);
-    if (translated) setCachedTranslation(text, sourceLanguage, targetLanguage, translated);
-    return translated;
+    const colloquial = await rewriteColloquialIfEnabled(translated, sourceLanguage, targetLanguage, text);
+    if (colloquial) setCachedTranslation(text, sourceLanguage, targetLanguage, colloquial);
+    return colloquial;
   }
 
   return {
