@@ -38,12 +38,22 @@ function createSttProviderFactory({
   getState,
   setState,
 }) {
+  function normalizeProvider(value) {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'google' || raw === 'deepgram' || raw === 'vachana') return raw;
+    return '';
+  }
+
   /**
    * Resolve the best STT provider for a given language code.
    * Returns 'google' | 'deepgram' | 'vachana'.
    */
-  function resolveProviderForLang(langCode) {
-    return sttProviderForLanguage(langCode, env);
+  function resolveProviderForLang(langCode, overrideEnvKey = '') {
+    if (overrideEnvKey) {
+      const forced = normalizeProvider(env(overrideEnvKey, ''));
+      if (forced) return forced;
+    }
+    return normalizeProvider(sttProviderForLanguage(langCode, env)) || 'vachana';
   }
 
   /**
@@ -81,7 +91,8 @@ function createSttProviderFactory({
    * ────────────────────────────────────────────────────────────────────── */
 
   async function connectCustomerStt(event, sourceLanguage, { enqueueTranscript, state }) {
-    const { provider, mode } = resolveForLang(sourceLanguage);
+    const provider = resolveProviderForLang(sourceLanguage, 'STT_PROVIDER_CUSTOMER');
+    const mode = resolveMode(provider);
     logInfo(`[CustomerPipeline] STT provider=${provider} mode=${mode} lang=${sourceLanguage}`);
 
     // Persist per-pipeline provider so audio routing knows where to send frames
@@ -112,7 +123,8 @@ function createSttProviderFactory({
    * ────────────────────────────────────────────────────────────────────── */
 
   async function connectAgentStt(event, targetLanguage, { enqueueTranscriptIncoming, state }) {
-    const { provider, mode } = resolveForLang(targetLanguage);
+    const provider = resolveProviderForLang(targetLanguage, 'STT_PROVIDER_AGENT');
+    const mode = resolveMode(provider);
     logInfo(`[AgentPipeline] STT provider=${provider} mode=${mode} lang=${targetLanguage}`);
 
     setState({ sttProviderAgent: provider });

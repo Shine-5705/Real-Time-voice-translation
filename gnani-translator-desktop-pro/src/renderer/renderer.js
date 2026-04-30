@@ -53,6 +53,7 @@ let lastMicTelemetryTs = 0;
 let meetingTtsGateUntil = 0;
 let localTtsGateUntil = 0;
 let micSpeakingUntil = 0;
+let lastRawSpeechTs = 0;
 let inputDeviceById = new Map();
 let outputDeviceById = new Map();
 const TARGET_SAMPLE_RATE = 16000;
@@ -68,6 +69,9 @@ const MIC_NOISE_SUPPRESSION = true;
 const MIC_AUTO_GAIN_CONTROL = true;
 const MIC_NOISE_GATE_THRESHOLD = 0.008;
 const MIC_NOISE_GATE_SOFT_GAIN = 0.12;
+const MIC_GATE_OPEN_RMS = 0.008;
+const MIC_GATE_HANGOVER_MS = 1400;
+const MIC_ADAPTIVE_RESET_IDLE_MS = 8000;
 /** Energy gate: pass frames clearly above an adapting noise floor (reduces TV/room bleed). */
 const MIC_ADAPTIVE_GATE_ENABLED = true;
 const MIC_ADAPTIVE_SPEECH_DB = 12;
@@ -81,7 +85,11 @@ let returnAdaptiveNoiseFloor = 0.002;
 let returnAdaptiveHangoverLeft = 0;
 const MIC_HIGHPASS_HZ = 120;
 const MIC_LOWPASS_HZ = 3800;
-const RETURN_PREAMP_GAIN = 1.4;
+const RETURN_PREAMP_GAIN = 2.0;
+const RETURN_ENABLE_ADAPTIVE_GATE = false;
+const RETURN_ENABLE_SOFT_GATE = false;
+const RETURN_DUCK_ON_LOCAL_MIC = false;
+const RETURN_ENABLE_BANDPASS_FILTER = false;
 const STT_SENDER_INTERVAL_MS = 16;
 const STT_MAX_FRAMES_PER_TICK = 4;
 const CAPTURE_BUFFER_SIZE = 512;
@@ -474,7 +482,7 @@ function emitMicTelemetry(floatArray) {
   lastMicTelemetryTs = now;
 
   const rms = computeRms(floatArray);
-  const speaking = rms > 0.01;
+  const speaking = rms > 0.01 || Date.now() < micSpeakingUntil;
   window.electronAPI.sendMicActivity({
     rms,
     speaking,
@@ -877,6 +885,8 @@ function teardownAudioGraph() {
   }
 
   pcmBuffer = new Int16Array(0);
+  micSpeakingUntil = 0;
+  lastRawSpeechTs = 0;
   adaptiveNoiseFloor = 0.002;
   adaptiveHangoverLeft = 0;
   returnAdaptiveNoiseFloor = 0.002;
@@ -956,9 +966,10 @@ async function startListenPipeline(listenDeviceId) {
     : {};
   const audioConstraints = {
     deviceId: { exact: listenDeviceId },
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: false,
+    // Loopback/mix devices are usually already processed; browser NS/EC can suppress them.
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: true,
     channelCount: 1,
     sampleRate: 16000,
   };
@@ -969,13 +980,15 @@ async function startListenPipeline(listenDeviceId) {
 
   returnAudioContext = new AudioContext({ sampleRate: 16000 });
   returnSourceNode = returnAudioContext.createMediaStreamSource(returnInputStream);
-  returnHighpassNode = returnAudioContext.createBiquadFilter();
-  returnHighpassNode.type = 'highpass';
-  returnHighpassNode.frequency.value = MIC_HIGHPASS_HZ;
+  if (RETURN_ENABLE_BANDPASS_FILTER) {
+    returnHighpassNode = returnAudioContext.createBiquadFilter();
+    returnHighpassNode.type = 'highpass';
+    returnHighpassNode.frequency.value = MIC_HIGHPASS_HZ;
 
-  returnLowpassNode = returnAudioContext.createBiquadFilter();
-  returnLowpassNode.type = 'lowpass';
-  returnLowpassNode.frequency.value = MIC_LOWPASS_HZ;
+    returnLowpassNode = returnAudioContext.createBiquadFilter();
+    returnLowpassNode.type = 'lowpass';
+    returnLowpassNode.frequency.value = MIC_LOWPASS_HZ;
+  }
 
   returnProcessorNode = returnAudioContext.createScriptProcessor(CAPTURE_BUFFER_SIZE, 1, 1);
   returnSilentGainNode = returnAudioContext.createGain();
@@ -989,6 +1002,8 @@ async function startListenPipeline(listenDeviceId) {
     const now = Date.now();
     const ttsGated = now < meetingTtsGateUntil;
     const micGated = now < micSpeakingUntil;
+    const shouldDuckForOverlap = ttsGated || (RETURN_DUCK_ON_LOCAL_MIC && micGated);
+    const shouldHardGate = ttsGated || (RETURN_DUCK_ON_LOCAL_MIC && micGated);
 
     if (now - returnLogTs > 5000) {
       returnLogTs = now;
@@ -997,7 +1012,7 @@ async function startListenPipeline(listenDeviceId) {
       returnPassedFrames = 0;
     }
 
-    if (!FULL_DUPLEX_OVERLAP_CAPTURE && (ttsGated || micGated)) {
+    if (!FULL_DUPLEX_OVERLAP_CAPTURE && shouldHardGate) {
       returnGatedFrames += 1;
       return;
     }
@@ -1006,19 +1021,29 @@ async function startListenPipeline(listenDeviceId) {
     const inputRate = e.inputBuffer.sampleRate || returnAudioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
-    const adaptive = applyAdaptiveSpeechGateReturn(resampled);
-    const gated = applySoftNoiseGate(adaptive);
-    let boosted = applyGain(gated, RETURN_PREAMP_GAIN);
-    if (FULL_DUPLEX_OVERLAP_CAPTURE && (ttsGated || micGated)) {
+    let processed = resampled;
+    if (RETURN_ENABLE_ADAPTIVE_GATE) {
+      processed = applyAdaptiveSpeechGateReturn(processed);
+    }
+    if (RETURN_ENABLE_SOFT_GATE) {
+      processed = applySoftNoiseGate(processed);
+    }
+    let boosted = applyGain(processed, RETURN_PREAMP_GAIN);
+    if (FULL_DUPLEX_OVERLAP_CAPTURE && shouldDuckForOverlap) {
       // In overlap conversations, attenuate instead of dropping so both sides are still transcribed.
       boosted = applyGain(boosted, OVERLAP_ATTENUATION_GAIN);
     }
     sendPCMToSTTReturn(toInt16(boosted));
   };
 
-  returnSourceNode.connect(returnHighpassNode);
-  returnHighpassNode.connect(returnLowpassNode);
-  returnLowpassNode.connect(returnProcessorNode);
+  if (RETURN_ENABLE_BANDPASS_FILTER) {
+    returnSourceNode.connect(returnHighpassNode);
+    returnHighpassNode.connect(returnLowpassNode);
+    returnLowpassNode.connect(returnProcessorNode);
+  } else {
+    // Other-side path: keep raw loopback audio (no filtering/noise cleanup).
+    returnSourceNode.connect(returnProcessorNode);
+  }
   returnProcessorNode.connect(returnSilentGainNode);
   returnSilentGainNode.connect(returnAudioContext.destination);
 }
@@ -1088,6 +1113,17 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
     const inputRate = e.inputBuffer.sampleRate || audioContext.sampleRate || TARGET_SAMPLE_RATE;
     const channel = e.inputBuffer.getChannelData(0);
     const resampled = resampleTo16k(channel, inputRate);
+    const rawRms = computeRms(resampled);
+    if (rawRms >= MIC_GATE_OPEN_RMS) {
+      lastRawSpeechTs = now;
+      micSpeakingUntil = now + MIC_GATE_HANGOVER_MS;
+    }
+    if (lastRawSpeechTs && now - lastRawSpeechTs > MIC_ADAPTIVE_RESET_IDLE_MS) {
+      // Recover quickly if adaptive floor drifted too high and started suppressing live speech.
+      adaptiveNoiseFloor = 0.002;
+      adaptiveHangoverLeft = 0;
+      lastRawSpeechTs = 0;
+    }
     const adaptive = applyAdaptiveSpeechGate(resampled);
     const gated = applySoftNoiseGate(adaptive);
     let boosted = applyGain(gated, PREAMP_GAIN);
@@ -1096,11 +1132,6 @@ async function startRealtimePipeline(inputDeviceId, outputDeviceId, options = {}
       boosted = applyGain(boosted, OVERLAP_ATTENUATION_GAIN);
     }
     emitMicTelemetry(boosted);
-
-    const rms = computeRms(boosted);
-    if (rms > 0.02) {
-      micSpeakingUntil = Date.now() + 600;
-    }
 
     sendPCMToSTT(toInt16(boosted));
   };
