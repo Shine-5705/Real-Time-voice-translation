@@ -734,6 +734,11 @@ function bootRuntime({ app, createMainWindow }) {
       const listenDeviceId = String(config.listenDeviceId || '').trim();
       const localOutputDeviceId = String(config.localOutputDeviceId || '').trim();
 
+      // Keep a single, deterministic Google voice for each translation session.
+      if (typeof ttsService.resetGoogleVoiceLock === 'function') {
+        ttsService.resetGoogleVoiceLock(targetLanguage);
+      }
+
       // Step 2: Initialize artifacts & reset state
       artifacts.initSessionArtifacts(appDir, sourceLanguage, targetLanguage);
       artifacts.writeEvent('session_start', {

@@ -44,7 +44,7 @@ function createTtsQueueService({
       try {
         const ttsProvider = env('TTS_PROVIDER', 'google').toLowerCase();
         const googleStreamToRenderer = ttsProvider === 'google' && env('GOOGLE_TTS_STREAM_TO_RENDERER', 'true').toLowerCase() === 'true';
-        const ttsRealtimeEnabled = ttsProvider !== 'google' && env('ENABLE_TTS_REALTIME_WS', 'false').toLowerCase() === 'true';
+        const ttsRealtimeEnabled = ttsProvider !== 'google' && env('ENABLE_TTS_REALTIME_WS', 'true').toLowerCase() === 'true';
         const ttsStartMs = Date.now();
         if (ttsRealtimeEnabled) {
           const ttsRealtimeEndpoint = env('VACHANA_TTS_REALTIME_ENDPOINT', 'wss://api.vachana.ai/api/v1/tts');

@@ -63,6 +63,8 @@ function createSttProviderFactory({
    */
   function resolveMode(provider = 'vachana') {
     if (provider !== 'vachana') return 'ws';
+    const forceRealtimeStreaming = String(env('FORCE_REALTIME_STREAMING', 'true')).toLowerCase() === 'true';
+    if (forceRealtimeStreaming) return 'ws';
     return String(env('VACHANA_STT_MODE', 'ws')).toLowerCase() === 'rest' ? 'rest' : 'ws';
   }
 
@@ -201,7 +203,9 @@ function createSttProviderFactory({
    * Respects the per-language provider for the REST transcription function too.
    */
   function fallbackCustomerToRest(event, sourceLanguage, { enqueueTranscript, state }) {
-    const restFallback = env('ENABLE_STT_REST_FALLBACK', 'true').toLowerCase() === 'true';
+    const forceRealtimeStreaming = String(env('FORCE_REALTIME_STREAMING', 'true')).toLowerCase() === 'true';
+    const restFallbackDefault = forceRealtimeStreaming ? 'false' : 'true';
+    const restFallback = env('ENABLE_STT_REST_FALLBACK', restFallbackDefault).toLowerCase() === 'true';
     if (!restFallback) return false;
 
     const provider = resolveProviderForLang(sourceLanguage);

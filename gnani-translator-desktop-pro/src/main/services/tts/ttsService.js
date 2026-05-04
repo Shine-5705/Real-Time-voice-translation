@@ -26,6 +26,8 @@ function createTtsService({
   }
 
   function googleTtsVoiceForLang(langCode) {
+    const fixedVoice = env('GOOGLE_TTS_FIXED_VOICE', '').trim() || env('GOOGLE_TTS_VOICE', '').trim();
+    if (fixedVoice) return fixedVoice;
     const override = env(`GOOGLE_TTS_VOICE_${String(langCode).toUpperCase().replace(/-/g, '_')}`, '').trim();
     if (override) return override;
     const lc = String(langCode).toLowerCase().split('-')[0];
@@ -56,7 +58,7 @@ function createTtsService({
       vi: 'vi-VN-Chirp3-HD-Aoede',
       zh: 'cmn-CN-Chirp3-HD-Aoede',
     };
-    return defaults[lc] || env('GOOGLE_TTS_VOICE', 'en-US-Chirp3-HD-Aoede');
+    return defaults[lc] || 'en-US-Chirp3-HD-Aoede';
   }
 
   function inferLanguageCodeFromVoiceName(voiceName, fallbackLangCode) {
@@ -64,6 +66,27 @@ function createTtsService({
     const m = String(voiceName || '').match(/^([a-z]{2,3}-[A-Z]{2,3})-/);
     if (m && m[1]) return m[1];
     return requested;
+  }
+
+  const lockGoogleVoiceForSession = env('GOOGLE_TTS_LOCK_SINGLE_VOICE', 'true').toLowerCase() === 'true';
+  let lockedGoogleVoiceName = env('GOOGLE_TTS_LOCKED_VOICE', '').trim();
+
+  function resetGoogleVoiceLock(langCode = '') {
+    if (!lockGoogleVoiceForSession) return '';
+    const preferredLangCode = String(langCode || '').trim();
+    lockedGoogleVoiceName = preferredLangCode ? googleTtsVoiceForLang(preferredLangCode) : '';
+    if (lockedGoogleVoiceName) logInfo(`[TTS] Locked Google voice for session: ${lockedGoogleVoiceName}`);
+    else logInfo('[TTS] Cleared Google voice lock for next session');
+    return lockedGoogleVoiceName;
+  }
+
+  function resolveGoogleVoice(langCode) {
+    if (!lockGoogleVoiceForSession) return googleTtsVoiceForLang(langCode);
+    if (!lockedGoogleVoiceName) {
+      lockedGoogleVoiceName = googleTtsVoiceForLang(langCode);
+      logInfo(`[TTS] Locked Google voice for session: ${lockedGoogleVoiceName}`);
+    }
+    return lockedGoogleVoiceName;
   }
 
   function buildWavHeader(pcmByteLength, sampleRate, numChannels = 1, bitsPerSample = 16) {
@@ -90,7 +113,7 @@ function createTtsService({
     const startMs = Date.now();
     const client = getGoogleTtsBetaClient();
     const bcp47 = toBcp47(langCode);
-    const voiceName = googleTtsVoiceForLang(bcp47);
+    const voiceName = resolveGoogleVoice(bcp47);
     const effectiveLanguageCode = inferLanguageCodeFromVoiceName(voiceName, bcp47);
     const sampleRate = Number(env('GOOGLE_TTS_SAMPLE_RATE', '24000'));
     const onPcmChunk = typeof opts.onPcmChunk === 'function' ? opts.onPcmChunk : null;
@@ -145,7 +168,7 @@ function createTtsService({
     const startMs = Date.now();
     const client = getGoogleTtsClient();
     const bcp47 = toBcp47(langCode);
-    const voiceName = googleTtsVoiceForLang(bcp47);
+    const voiceName = resolveGoogleVoice(bcp47);
     const effectiveLanguageCode = inferLanguageCodeFromVoiceName(voiceName, bcp47);
     const sampleRate = Number(env('GOOGLE_TTS_SAMPLE_RATE', '24000'));
     const [response] = await client.synthesizeSpeech({
@@ -400,6 +423,7 @@ function createTtsService({
     synthesizeTTS,
     synthesizeRestTtsSequentialToRenderer,
     streamTTSRealtime,
+    resetGoogleVoiceLock,
   };
 }
 

@@ -20,7 +20,7 @@ function createTtsProviderFactory({ env, ttsService }) {
   function resolve() {
     const provider = String(env('TTS_PROVIDER', 'google')).toLowerCase() === 'google' ? 'google' : 'vachana';
     const realtimeWs = provider !== 'google'
-      && String(env('ENABLE_TTS_REALTIME_WS', 'false')).toLowerCase() === 'true';
+      && String(env('ENABLE_TTS_REALTIME_WS', 'true')).toLowerCase() === 'true';
     return { provider, realtimeWs };
   }
 
