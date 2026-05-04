@@ -86,6 +86,37 @@ function normalizeTranscriptForDedupe(text) {
     .trim();
 }
 
+function tokenizeNormalized(text) {
+  return String(text || '').split(' ').map((t) => t.trim()).filter(Boolean);
+}
+
+function isLikelyEchoText(candidateNorm, referenceNorm) {
+  const a = String(candidateNorm || '').trim();
+  const b = String(referenceNorm || '').trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  // Common loopback pattern: STT hears a shortened/expanded version.
+  const minContainChars = 14;
+  if (Math.min(a.length, b.length) >= minContainChars) {
+    if (a.includes(b) || b.includes(a)) return true;
+  }
+
+  const aTokens = tokenizeNormalized(a);
+  const bTokens = tokenizeNormalized(b);
+  if (aTokens.length < 4 || bTokens.length < 4) return false;
+
+  const aSet = new Set(aTokens);
+  const bSet = new Set(bTokens);
+  let intersect = 0;
+  for (const token of aSet) {
+    if (bSet.has(token)) intersect += 1;
+  }
+  const smaller = Math.max(1, Math.min(aSet.size, bSet.size));
+  const overlap = intersect / smaller;
+  return overlap >= 0.72;
+}
+
 function extractSpeakerIdFromStt(msg) {
   if (!msg || typeof msg !== 'object') return '';
   const direct = msg.speaker_id ?? msg.speakerId ?? msg.speaker ?? msg.spk_id ?? msg.participant_id;
@@ -180,7 +211,13 @@ function bootRuntime({ app, createMainWindow }) {
     // Segment tracking
     segmentCounter: 0,
     lastEnqueuedTranscriptNorm: '',
+    lastEnqueuedTranscriptAtMs: 0,
     lastEnqueuedTranscriptNormIncoming: '',
+    lastEnqueuedTranscriptIncomingAtMs: 0,
+    lastOutgoingTranslatedNorm: '',
+    lastOutgoingTranslatedAtMs: 0,
+    lastIncomingTranslatedNorm: '',
+    lastIncomingTranslatedAtMs: 0,
 
     // Translation context windows
     recentSourceContext: [],
@@ -253,6 +290,44 @@ function bootRuntime({ app, createMainWindow }) {
     while (targetBuf.length > maxSegments) targetBuf.shift();
     while (sourceBuf.join(' ').length > maxChars && sourceBuf.length > 1) sourceBuf.shift();
     while (targetBuf.join(' ').length > maxChars && targetBuf.length > 1) targetBuf.shift();
+    const translatedNorm = normalizeTranscriptForDedupe(target);
+    if (translatedNorm) {
+      const nowMs = Date.now();
+      if (direction === 'incoming') {
+        state.lastIncomingTranslatedNorm = translatedNorm;
+        state.lastIncomingTranslatedAtMs = nowMs;
+      } else {
+        state.lastOutgoingTranslatedNorm = translatedNorm;
+        state.lastOutgoingTranslatedAtMs = nowMs;
+      }
+    }
+  }
+
+  function suppressCrossChannelEcho(direction, normalizedText) {
+    const enabled = env('ENABLE_CROSS_CHANNEL_ECHO_SUPPRESSION', 'true').toLowerCase() === 'true';
+    if (!enabled || !normalizedText) return false;
+    const windowMs = Number(env('CROSS_CHANNEL_ECHO_WINDOW_MS', '8000'));
+    const nowMs = Date.now();
+    const withinWindow = (ts) => ts > 0 && (nowMs - ts) <= windowMs;
+    const echoMatches = (refNorm, refTs) => withinWindow(refTs) && isLikelyEchoText(normalizedText, refNorm);
+
+    if (direction === 'incoming') {
+      if (echoMatches(state.lastEnqueuedTranscriptNorm, state.lastEnqueuedTranscriptAtMs)) {
+        return 'matched_recent_outgoing_stt';
+      }
+      if (echoMatches(state.lastOutgoingTranslatedNorm, state.lastOutgoingTranslatedAtMs)) {
+        return 'matched_recent_outgoing_tts';
+      }
+      return false;
+    }
+
+    if (echoMatches(state.lastEnqueuedTranscriptNormIncoming, state.lastEnqueuedTranscriptIncomingAtMs)) {
+      return 'matched_recent_incoming_stt';
+    }
+    if (echoMatches(state.lastIncomingTranslatedNorm, state.lastIncomingTranslatedAtMs)) {
+      return 'matched_recent_incoming_tts';
+    }
+    return false;
   }
 
   function getContextHint() {
@@ -291,7 +366,14 @@ function bootRuntime({ app, createMainWindow }) {
     }
     const normalized = normalizeTranscriptForDedupe(msg.text);
     if (normalized && normalized === state.lastEnqueuedTranscriptNorm) return;
+    const echoReason = suppressCrossChannelEcho('outgoing', normalized);
+    if (echoReason) {
+      logInfo(`[CustomerPipeline] Echo-loop transcript skipped (${echoReason}): "${String(msg.text).trim()}"`);
+      artifacts.writeEvent('segment_skipped_echo_loop', { direction: 'outgoing', reason: echoReason, raw_text: String(msg.text).trim() });
+      return;
+    }
     state.lastEnqueuedTranscriptNorm = normalized;
+    state.lastEnqueuedTranscriptAtMs = Date.now();
     state.segmentCounter += 1;
     transcriptQueue.push({
       id: state.segmentCounter,
@@ -316,7 +398,14 @@ function bootRuntime({ app, createMainWindow }) {
     if (!isMeaningfulTranscript(msg.text)) return;
     const normalized = normalizeTranscriptForDedupe(msg.text);
     if (normalized && normalized === state.lastEnqueuedTranscriptNormIncoming) return;
+    const echoReason = suppressCrossChannelEcho('incoming', normalized);
+    if (echoReason) {
+      logInfo(`[AgentPipeline] Echo-loop transcript skipped (${echoReason}): "${String(msg.text).trim()}"`);
+      artifacts.writeEvent('segment_skipped_echo_loop', { direction: 'incoming', reason: echoReason, raw_text: String(msg.text).trim() });
+      return;
+    }
     state.lastEnqueuedTranscriptNormIncoming = normalized;
+    state.lastEnqueuedTranscriptIncomingAtMs = Date.now();
     state.segmentCounter += 1;
     transcriptQueue.push({
       id: state.segmentCounter,
@@ -691,7 +780,13 @@ function bootRuntime({ app, createMainWindow }) {
       state.audioFramesDropped = 0;
       state.segmentCounter = 0;
       state.lastEnqueuedTranscriptNorm = '';
+      state.lastEnqueuedTranscriptAtMs = 0;
       state.lastEnqueuedTranscriptNormIncoming = '';
+      state.lastEnqueuedTranscriptIncomingAtMs = 0;
+      state.lastOutgoingTranslatedNorm = '';
+      state.lastOutgoingTranslatedAtMs = 0;
+      state.lastIncomingTranslatedNorm = '';
+      state.lastIncomingTranslatedAtMs = 0;
       state.recentSourceContext = [];
       state.recentTargetContext = [];
       state.recentIncomingSourceContext = [];
