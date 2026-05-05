@@ -46,6 +46,29 @@ function createDeepgramStreamingSttService({
     return String((alt && alt.transcript) || '').trim();
   }
 
+  function splitWords(text) {
+    return String(text || '').trim().split(/\s+/).filter(Boolean);
+  }
+
+  function deltaAfterCommonPrefix(previousText, currentText) {
+    const prev = splitWords(previousText);
+    const curr = splitWords(currentText);
+    let i = 0;
+    while (i < prev.length && i < curr.length && prev[i].toLowerCase() === curr[i].toLowerCase()) i += 1;
+    return curr.slice(i).join(' ').trim();
+  }
+
+  function shouldCommitInterim(nowMs, deltaText, lastCommitTs) {
+    const enabled = String(env('STT_INTERIM_COMMIT_ENABLED', 'true')).toLowerCase() === 'true';
+    if (!enabled) return false;
+    const minChars = Math.max(3, Number(env('STT_INTERIM_COMMIT_MIN_CHARS', '10')));
+    const minNewChars = Math.max(2, Number(env('STT_INTERIM_COMMIT_MIN_NEW_CHARS', '6')));
+    const throttleMs = Math.max(0, Number(env('STT_INTERIM_COMMIT_THROTTLE_MS', '220')));
+    return deltaText.length >= minChars
+      && deltaText.length >= minNewChars
+      && (nowMs - lastCommitTs) >= throttleMs;
+  }
+
   function connectSTT(event, sourceLanguage) {
     return new Promise((resolve, reject) => {
       const apiKey = env('DEEPGRAM_API_KEY', '').trim();
@@ -59,6 +82,8 @@ function createDeepgramStreamingSttService({
         },
       });
       setSockets({ sttSocket: socket });
+      let committedOutgoing = '';
+      let lastCommitOutgoingTs = 0;
 
       socket.on('open', () => resolve());
 
@@ -71,9 +96,18 @@ function createDeepgramStreamingSttService({
           if (!text) return;
 
           if (msg.is_final) {
+            const deltaFinal = deltaAfterCommonPrefix(committedOutgoing, text);
+            committedOutgoing = '';
+            lastCommitOutgoingTs = 0;
+            if (!deltaFinal) {
+              if (typeof sendInterimTranscript === 'function') {
+                sendInterimTranscript(event, { text: '', final: true, direction: 'outgoing' });
+              }
+              return;
+            }
             enqueueTranscript(event, {
               type: 'transcript',
-              text,
+              text: deltaFinal,
               detected_language: sourceLanguage,
               latency: 'deepgram-stream',
             });
@@ -81,6 +115,19 @@ function createDeepgramStreamingSttService({
               sendInterimTranscript(event, { text: '', final: true, direction: 'outgoing' });
             }
             return;
+          }
+
+          const now = Date.now();
+          const deltaInterim = deltaAfterCommonPrefix(committedOutgoing, text);
+          if (shouldCommitInterim(now, deltaInterim, lastCommitOutgoingTs)) {
+            committedOutgoing = text;
+            lastCommitOutgoingTs = now;
+            enqueueTranscript(event, {
+              type: 'transcript',
+              text: deltaInterim,
+              detected_language: sourceLanguage,
+              latency: 'deepgram-stream-interim',
+            });
           }
 
           if (typeof sendInterimTranscript === 'function') {
@@ -117,6 +164,8 @@ function createDeepgramStreamingSttService({
         },
       });
       setSockets({ sttSocketReturn: socket });
+      let committedIncoming = '';
+      let lastCommitIncomingTs = 0;
 
       socket.on('open', () => resolve());
 
@@ -129,9 +178,18 @@ function createDeepgramStreamingSttService({
           if (!text) return;
 
           if (msg.is_final) {
+            const deltaFinal = deltaAfterCommonPrefix(committedIncoming, text);
+            committedIncoming = '';
+            lastCommitIncomingTs = 0;
+            if (!deltaFinal) {
+              if (typeof sendInterimTranscriptIncoming === 'function') {
+                sendInterimTranscriptIncoming(event, { text: '', final: true, direction: 'incoming' });
+              }
+              return;
+            }
             enqueueTranscriptIncoming(event, {
               type: 'transcript',
-              text,
+              text: deltaFinal,
               detected_language: targetLanguage,
               latency: 'deepgram-stream-return',
             });
@@ -139,6 +197,19 @@ function createDeepgramStreamingSttService({
               sendInterimTranscriptIncoming(event, { text: '', final: true, direction: 'incoming' });
             }
             return;
+          }
+
+          const now = Date.now();
+          const deltaInterim = deltaAfterCommonPrefix(committedIncoming, text);
+          if (shouldCommitInterim(now, deltaInterim, lastCommitIncomingTs)) {
+            committedIncoming = text;
+            lastCommitIncomingTs = now;
+            enqueueTranscriptIncoming(event, {
+              type: 'transcript',
+              text: deltaInterim,
+              detected_language: targetLanguage,
+              latency: 'deepgram-stream-return-interim',
+            });
           }
 
           if (typeof sendInterimTranscriptIncoming === 'function') {

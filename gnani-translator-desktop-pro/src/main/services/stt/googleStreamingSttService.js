@@ -34,6 +34,33 @@ function createGoogleStreamingSttService({
   let speculatedIncoming = '';
   let stabilityTimerOutgoing = null;
   let stabilityTimerIncoming = null;
+  let committedOutgoing = '';
+  let committedIncoming = '';
+  let lastCommitOutgoingTs = 0;
+  let lastCommitIncomingTs = 0;
+
+  function splitWords(text) {
+    return String(text || '').trim().split(/\s+/).filter(Boolean);
+  }
+
+  function deltaAfterCommonPrefix(previousText, currentText) {
+    const prev = splitWords(previousText);
+    const curr = splitWords(currentText);
+    let i = 0;
+    while (i < prev.length && i < curr.length && prev[i].toLowerCase() === curr[i].toLowerCase()) i += 1;
+    return curr.slice(i).join(' ').trim();
+  }
+
+  function shouldCommitInterim(nowMs, deltaText, lastCommitTs) {
+    const enabled = String(env('STT_INTERIM_COMMIT_ENABLED', 'true')).toLowerCase() === 'true';
+    if (!enabled) return false;
+    const minChars = Math.max(3, Number(env('STT_INTERIM_COMMIT_MIN_CHARS', '10')));
+    const minNewChars = Math.max(2, Number(env('STT_INTERIM_COMMIT_MIN_NEW_CHARS', '6')));
+    const throttleMs = Math.max(0, Number(env('STT_INTERIM_COMMIT_THROTTLE_MS', '220')));
+    return deltaText.length >= minChars
+      && deltaText.length >= minNewChars
+      && (nowMs - lastCommitTs) >= throttleMs;
+  }
 
   function extractInterimTranscript(response) {
     const parts = [];
@@ -137,10 +164,14 @@ function createGoogleStreamingSttService({
     if (direction === 'outgoing') {
       lastInterimOutgoing = '';
       speculatedOutgoing = '';
+      committedOutgoing = '';
+      lastCommitOutgoingTs = 0;
       if (stabilityTimerOutgoing) { clearTimeout(stabilityTimerOutgoing); stabilityTimerOutgoing = null; }
     } else {
       lastInterimIncoming = '';
       speculatedIncoming = '';
+      committedIncoming = '';
+      lastCommitIncomingTs = 0;
       if (stabilityTimerIncoming) { clearTimeout(stabilityTimerIncoming); stabilityTimerIncoming = null; }
     }
   }
@@ -164,10 +195,17 @@ function createGoogleStreamingSttService({
       const text = extractFinalTranscript(response);
       if (text) {
         logInfo(`Google STT final transcript len=${text.length}`);
+        const deltaFinal = deltaAfterCommonPrefix(committedOutgoing, text);
         resetInterimState('outgoing');
+        if (!deltaFinal) {
+          if (typeof sendInterimTranscript === 'function') {
+            sendInterimTranscript(event, { text: '', final: true });
+          }
+          return;
+        }
         enqueueTranscript(event, {
           type: 'transcript',
-          text,
+          text: deltaFinal,
           detected_language: sourceLanguage,
           latency: 'google-stream',
         });
@@ -184,6 +222,17 @@ function createGoogleStreamingSttService({
       checkStability('outgoing', interim, sourceLanguage);
 
       const now = Date.now();
+      const deltaInterim = deltaAfterCommonPrefix(committedOutgoing, interim);
+      if (shouldCommitInterim(now, deltaInterim, lastCommitOutgoingTs)) {
+        committedOutgoing = interim;
+        lastCommitOutgoingTs = now;
+        enqueueTranscript(event, {
+          type: 'transcript',
+          text: deltaInterim,
+          detected_language: sourceLanguage,
+          latency: 'google-stream-interim',
+        });
+      }
       if (now - lastInterimSentTs >= interimThrottleMs) {
         lastInterimSentTs = now;
         if (typeof sendInterimTranscript === 'function') {
@@ -228,10 +277,17 @@ function createGoogleStreamingSttService({
       const text = extractFinalTranscript(response);
       if (text) {
         logInfo(`Google STT return final transcript len=${text.length}`);
+        const deltaFinal = deltaAfterCommonPrefix(committedIncoming, text);
         resetInterimState('incoming');
+        if (!deltaFinal) {
+          if (typeof sendInterimTranscriptIncoming === 'function') {
+            sendInterimTranscriptIncoming(event, { text: '', final: true });
+          }
+          return;
+        }
         enqueueTranscriptIncoming(event, {
           type: 'transcript',
-          text,
+          text: deltaFinal,
           detected_language: targetLanguage,
           latency: 'google-stream-return',
         });
@@ -247,6 +303,17 @@ function createGoogleStreamingSttService({
       checkStability('incoming', interim, targetLanguage);
 
       const now = Date.now();
+      const deltaInterim = deltaAfterCommonPrefix(committedIncoming, interim);
+      if (shouldCommitInterim(now, deltaInterim, lastCommitIncomingTs)) {
+        committedIncoming = interim;
+        lastCommitIncomingTs = now;
+        enqueueTranscriptIncoming(event, {
+          type: 'transcript',
+          text: deltaInterim,
+          detected_language: targetLanguage,
+          latency: 'google-stream-return-interim',
+        });
+      }
       if (now - lastInterimSentTs >= interimThrottleMs) {
         lastInterimSentTs = now;
         if (typeof sendInterimTranscriptIncoming === 'function') {
