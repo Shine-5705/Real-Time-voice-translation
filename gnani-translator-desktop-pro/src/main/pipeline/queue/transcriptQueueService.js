@@ -23,6 +23,18 @@ function createTranscriptQueueService({
     try {
       while (transcriptQueue.length > 0) {
         const item = transcriptQueue.shift();
+        const dropStaleEnabled = String(env('TRANSCRIPT_QUEUE_DROP_STALE_ENABLED', 'true')).toLowerCase() === 'true';
+        const maxQueueWaitMs = Math.max(400, Number(env('TRANSCRIPT_QUEUE_MAX_WAIT_MS', '1800')));
+        const queuedForMs = elapsedMs(item?.createdAtMs || Date.now());
+        if (dropStaleEnabled && queuedForMs > maxQueueWaitMs) {
+          writeEvent('segment_transcript_dropped_stale', {
+            segment_id: item?.id,
+            queued_for_ms: queuedForMs,
+            max_wait_ms: maxQueueWaitMs,
+          });
+          logInfo(`Transcript stale segment dropped seg=${item?.id} queued_ms=${queuedForMs} max_ms=${maxQueueWaitMs}`);
+          continue;
+        }
         const event = item.event;
         const segmentStartMs = Number(item.createdAtMs || Date.now());
         try {
@@ -121,6 +133,18 @@ function createTranscriptQueueService({
 
   function push(item) {
     transcriptQueue.push(item);
+    const maxItems = Math.max(1, Number(env('TRANSCRIPT_QUEUE_MAX_ITEMS', '8')));
+    const keepLatestOnly = String(env('TRANSCRIPT_QUEUE_KEEP_LATEST_ONLY', 'true')).toLowerCase() === 'true';
+    if (keepLatestOnly && transcriptQueue.length > maxItems) {
+      while (transcriptQueue.length > maxItems) {
+        const dropped = transcriptQueue.shift();
+        writeEvent('segment_transcript_dropped_backpressure', {
+          segment_id: dropped?.id,
+          reason: 'queue_limit',
+          max_items: maxItems,
+        });
+      }
+    }
     processTranscriptQueue().catch((err) => logError(`QUEUE ERROR: ${err.message}`));
   }
 

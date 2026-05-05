@@ -242,7 +242,8 @@ function createTtsService({
   }
 
   function splitTextForSequentialTts(text) {
-    const maxChars = Math.max(48, Number(env('VACHANA_TTS_MAX_CHARS_PER_CHUNK', '120')));
+    const minChars = Math.max(12, Number(env('TTS_MIN_CHARS_PER_CHUNK', '24')));
+    const maxChars = Math.max(minChars, Number(env('TTS_MAX_CHARS_PER_CHUNK', env('VACHANA_TTS_MAX_CHARS_PER_CHUNK', '80'))));
     const t = String(text || '').replace(/\s+/g, ' ').trim();
     if (!t) return [];
     if (t.length <= maxChars) return [t];

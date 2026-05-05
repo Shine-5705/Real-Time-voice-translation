@@ -16,6 +16,48 @@ function createTtsQueueService({
   const ttsJobQueue = [];
   let ttsWorkerActive = false;
 
+  function coalesceQueuedJobs(baseJob) {
+    const enabled = String(env('TTS_QUEUE_COALESCE_ENABLED', 'true')).toLowerCase() === 'true';
+    if (!enabled || !baseJob) return baseJob;
+    const maxGapMs = Math.max(0, Number(env('TTS_QUEUE_COALESCE_MAX_GAP_MS', '320')));
+    const maxChars = Math.max(32, Number(env('TTS_QUEUE_COALESCE_MAX_CHARS', '180')));
+    let merged = {
+      ...baseJob,
+      translatedText: String(baseJob.translatedText || '').trim(),
+      sourceText: String(baseJob.sourceText || '').trim(),
+    };
+    if (!merged.translatedText) return merged;
+
+    while (ttsJobQueue.length > 0) {
+      const next = ttsJobQueue[0];
+      if (!next) break;
+      if (String(next.playbackChannel || '') !== String(merged.playbackChannel || '')) break;
+      if (String(next.ttsLangCode || '') !== String(merged.ttsLangCode || '')) break;
+      const nextText = String(next.translatedText || '').trim();
+      if (!nextText) {
+        ttsJobQueue.shift();
+        continue;
+      }
+      const mergedLen = merged.translatedText.length;
+      if ((mergedLen + 1 + nextText.length) > maxChars) break;
+      const gapMs = Math.max(0, Number(next.segmentStartMs || Date.now()) - Number(merged.segmentStartMs || Date.now()));
+      if (gapMs > maxGapMs) break;
+
+      ttsJobQueue.shift();
+      merged = {
+        ...merged,
+        translatedText: `${merged.translatedText} ${nextText}`.trim(),
+        sourceText: `${String(merged.sourceText || '').trim()} ${String(next.sourceText || '').trim()}`.trim(),
+      };
+      writeEvent('segment_tts_coalesced', {
+        into_segment_id: merged.segmentId,
+        merged_segment_id: next.segmentId,
+        gap_ms: gapMs,
+      });
+    }
+    return merged;
+  }
+
   function enqueueTtsJob(job) {
     ttsJobQueue.push(job);
     processTtsJobQueue().catch((error) => {
@@ -27,7 +69,20 @@ function createTtsQueueService({
     if (ttsWorkerActive) return;
     ttsWorkerActive = true;
     while (ttsJobQueue.length > 0) {
-      const job = ttsJobQueue.shift();
+      const rawJob = ttsJobQueue.shift();
+      const dropStaleEnabled = String(env('TTS_QUEUE_DROP_STALE_ENABLED', 'true')).toLowerCase() === 'true';
+      const maxQueueWaitMs = Math.max(500, Number(env('TTS_QUEUE_MAX_WAIT_MS', '2500')));
+      const queuedForMs = elapsedMs(rawJob?.segmentStartMs || Date.now());
+      if (dropStaleEnabled && queuedForMs > maxQueueWaitMs) {
+        writeEvent('segment_tts_dropped_stale', {
+          segment_id: rawJob?.segmentId,
+          queued_for_ms: queuedForMs,
+          max_wait_ms: maxQueueWaitMs,
+        });
+        logInfo(`TTS stale segment dropped seg=${rawJob?.segmentId} queued_ms=${queuedForMs} max_ms=${maxQueueWaitMs}`);
+        continue;
+      }
+      const job = coalesceQueuedJobs(rawJob);
       const {
         segmentId,
         translatedText,
